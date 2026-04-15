@@ -5,17 +5,26 @@ import asyncio
 import logging
 import sys
 
+from rich.console import Console
+from rich.panel import Panel
+
 from src.config import Config
 from src.errors import WorkflowError
+from src.progress import WorkflowProgress
 
 
-def _create_foundry_agents(config: Config):
+console = Console()
+
+
+def _create_foundry_agents(config: Config, progress: WorkflowProgress):
     """Create FoundryAgent instances for both workflow agents."""
     from agent_framework.foundry import FoundryAgent
     from azure.identity import DefaultAzureCredential
 
+    progress.advance("Authenticating with Azure")
     credential = DefaultAzureCredential()
 
+    progress.advance("Creating CategorizeRiskAgent")
     categorize_agent = FoundryAgent(
         project_endpoint=config.foundry_endpoint,
         agent_name=config.categorize_agent_name,
@@ -23,6 +32,7 @@ def _create_foundry_agents(config: Config):
         credential=credential,
     )
 
+    progress.advance("Creating SummarizeAgent")
     summarize_agent = FoundryAgent(
         project_endpoint=config.foundry_endpoint,
         agent_name=config.summarize_agent_name,
@@ -37,29 +47,50 @@ async def run_workflow(client_id: str, config: Config, output_json: bool = False
     """Execute the risk assessment workflow via MAF SequentialBuilder."""
     from src.workflow.orchestrator import RiskAssessmentWorkflow
 
-    try:
-        categorize_agent, summarize_agent = _create_foundry_agents(config)
-    except Exception as e:
-        print(f"Error: Could not initialize Foundry agents: {e}", file=sys.stderr)
-        return 1
+    with WorkflowProgress(console=console) as progress:
+        progress.advance("Loading configuration")
 
-    workflow = RiskAssessmentWorkflow(categorize_agent, summarize_agent, config)
+        try:
+            categorize_agent, summarize_agent = _create_foundry_agents(config, progress)
+        except Exception as e:
+            progress.fail("Agent initialization failed")
+            console.print(f"\n[bold red]Error:[/] Could not initialize Foundry agents: {e}")
+            return 1
 
-    try:
-        result = await workflow.execute(client_id)
-    except WorkflowError as e:
-        print(f"Workflow error: {e}", file=sys.stderr)
-        return 1
+        progress.advance("Building workflow pipeline")
+        workflow = RiskAssessmentWorkflow(categorize_agent, summarize_agent, config)
+
+        try:
+            progress.advance("Running risk assessment")
+            result = await workflow.execute(client_id)
+        except WorkflowError as e:
+            progress.fail("Workflow failed")
+            console.print(f"\n[bold red]Workflow error:[/] {e}")
+            return 1
+
+        progress.advance("Parsing results")
+        progress.complete()
+
+    console.print()
 
     if output_json:
-        print(result.model_dump_json(indent=2))
+        console.print_json(result.model_dump_json(indent=2))
     else:
-        print(f"\n{'=' * 60}")
-        print("RISK ASSESSMENT COMPLETE")
-        print(f"{'=' * 60}")
-        print(f"Client ID:  {result.client_id}")
-        print(f"Risk Score: {result.risk_score}")
-        print(f"\n{result.summary.summary_markdown or result.summary.summary_plain_text}")
+        risk_color = {
+            "Low": "green", "Medium": "yellow", "High": "red"
+        }.get(result.risk_score, "white")
+
+        console.print(Panel.fit(
+            f"[bold]Client ID:[/]  {result.client_id}\n"
+            f"[bold]Risk Score:[/] [{risk_color} bold]{result.risk_score}[/]",
+            title="[bold cyan]Risk Assessment Complete[/]",
+            border_style="cyan",
+        ))
+        body = result.summary.summary_markdown or result.summary.summary_plain_text
+        if body:
+            console.print()
+            from rich.markdown import Markdown
+            console.print(Markdown(body))
 
     return 0
 
@@ -77,10 +108,10 @@ def main(argv: list[str] | None = None) -> int:
 
     config = Config()
 
-    logging.basicConfig(
-        level=getattr(logging, config.log_level, logging.INFO),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    # Suppress noisy SDK logging — milestones are shown via progress bar
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("agent_framework").setLevel(logging.WARNING)
+    logging.basicConfig(level=logging.WARNING)
 
     return asyncio.run(run_workflow(args.client_id, config, args.output_json))
 
