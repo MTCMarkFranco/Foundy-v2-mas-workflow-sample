@@ -6,7 +6,6 @@ from typing import Any
 
 from agent_framework.orchestrations import SequentialBuilder
 
-from src.agents.base_agent import strip_code_fence
 from src.config import Config
 from src.errors import AgentInvocationError, InvalidClientIdError, WorkflowError
 from src.models.input import CLIENT_ID_PATTERN, WorkflowInput
@@ -119,10 +118,21 @@ class RiskAssessmentWorkflow:
         return texts
 
     @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """Remove markdown code fences if present."""
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            first_newline = stripped.index("\n")
+            stripped = stripped[first_newline + 1:]
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        return stripped.strip()
+
+    @staticmethod
     def _parse_assessment(raw_text: str, client_id: str) -> RiskAssessment:
         """Parse and validate CategorizeRiskAgent JSON output."""
         try:
-            data = json.loads(strip_code_fence(raw_text))
+            data = json.loads(RiskAssessmentWorkflow._strip_code_fence(raw_text))
             assessment = RiskAssessment.model_validate(data)
         except (json.JSONDecodeError, Exception) as e:
             raise AgentInvocationError(
@@ -144,7 +154,7 @@ class RiskAssessmentWorkflow:
     ) -> SummaryOutput:
         """Parse and validate SummarizeAgent JSON output."""
         try:
-            data = json.loads(strip_code_fence(raw_text))
+            data = json.loads(RiskAssessmentWorkflow._strip_code_fence(raw_text))
             summary = SummaryOutput.model_validate(data)
         except (json.JSONDecodeError, Exception) as e:
             raise AgentInvocationError(
