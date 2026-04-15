@@ -1,0 +1,129 @@
+{
+  "name": "client-risk-data",
+  "fields": [
+    {
+      "name": "id",
+      "type": "Edm.String",
+      "key": true,
+      "filterable": true,
+      "searchable": false,
+      "sortable": false,
+      "facetable": false
+    },
+    {
+      "name": "client_id",
+      "type": "Edm.String",
+      "filterable": true,
+      "searchable": true,
+      "sortable": false,
+      "facetable": true
+    },
+    {
+      "name": "client_name",
+      "type": "Edm.String",
+      "filterable": false,
+      "searchable": true,
+      "sortable": true,
+      "facetable": false
+    },
+    {
+      "name": "document_type",
+      "type": "Edm.String",
+      "filterable": true,
+      "searchable": true,
+      "sortable": false,
+      "facetable": true
+    },
+    {
+      "name": "compliance_status",
+      "type": "Edm.String",
+      "filterable": true,
+      "searchable": false,
+      "sortable": false,
+      "facetable": true
+    },
+    {
+      "name": "compliance_expiry_date",
+      "type": "Edm.DateTimeOffset",
+      "filterable": true,
+      "searchable": false,
+      "sortable": true,
+      "facetable": false
+    },
+    {
+      "name": "last_review_date",
+      "type": "Edm.DateTimeOffset",
+      "filterable": true,
+      "searchable": false,
+      "sortable": true,
+      "facetable": false
+    },
+    {
+      "name": "risk_flags",
+      "type": "Collection(Edm.String)",
+      "filterable": true,
+      "searchable": true,
+      "sortable": false,
+      "facetable": true
+    },
+    {
+      "name": "document_content",
+      "type": "Edm.String",
+      "filterable": false,
+      "searchable": true,
+      "sortable": false,
+      "facetable": false,
+      "analyzer": "en.microsoft"
+    },
+    {
+      "name": "notes",
+      "type": "Edm.String",
+      "filterable": false,
+      "searchable": true,
+      "sortable": false,
+      "facetable": false
+    }
+  ],
+  "semantic": {
+    "defaultConfiguration": "default-semantic",
+    "configurations": [
+      {
+        "name": "default-semantic",
+        "prioritizedFields": {
+          "titleField": {
+            "fieldName": "document_type"
+          },
+          "contentFields": [
+            {
+              "fieldName": "document_content"
+            },
+            {
+              "fieldName": "notes"
+            }
+          ],
+          "keywordsFields": [
+            {
+              "fieldName": "risk_flags"
+            },
+            {
+              "fieldName": "compliance_status"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "suggesters": [],
+  "scoringProfiles": [
+    {
+      "name": "risk-boost",
+      "text": {
+        "weights": {
+          "document_content": 2.0,
+          "risk_flags": 3.0,
+          "notes": 1.5
+        }
+      }
+    }
+  ]
+}
