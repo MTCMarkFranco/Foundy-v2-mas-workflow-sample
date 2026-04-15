@@ -1,8 +1,7 @@
 """Tests for the workflow orchestrator and end-to-end flow."""
 
 import json
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -111,101 +110,99 @@ SAMPLE_SUMMARY_RESPONSE = {
     "generated_timestamp": "2026-04-15T00:00:00Z",
 }
 
-# Expected risk scores per the prompt contracts
-EXPECTED_RISK = {
-    "CLT-10001": "Low",
-    "CLT-20002": "Medium",
-    "CLT-30003": "High",
-    "CLT-40004": "Low",  # Minor flag → weighted 1 → Medium by local calc
-    "CLT-50005": "High",
-}
 
+def _build_mock_agents(categorize_resp: dict, summarize_resp: dict):
+    """Build mock FoundryAgent instances with staged responses."""
+    categorize_agent = AsyncMock()
+    categorize_agent.run.return_value = json.dumps(categorize_resp)
 
-def _build_mock_project_client(categorize_resp: dict, summarize_resp: dict) -> MagicMock:
-    """Build a mock AIProjectClient whose openai_client returns staged responses."""
-    openai_client = MagicMock()
+    summarize_agent = AsyncMock()
+    summarize_agent.run.return_value = json.dumps(summarize_resp)
 
-    # responses.create is called twice: first for categorize, then for summarize
-    openai_client.responses.create.side_effect = [
-        SimpleNamespace(output_text=json.dumps(categorize_resp)),
-        SimpleNamespace(output_text=json.dumps(summarize_resp)),
-    ]
-
-    project_client = MagicMock()
-    project_client.get_openai_client.return_value = openai_client
-    return project_client
+    return categorize_agent, summarize_agent
 
 
 # ── Workflow tests ───────────────────────────────────────────────────
 
 class TestRiskAssessmentWorkflow:
-    def test_execute_low_risk_client(self):
+    @pytest.mark.asyncio
+    async def test_execute_low_risk_client(self):
         cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
         sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": "CLT-10001", "risk_score": "Low"}
-        mock = _build_mock_project_client(cat_resp, sum_resp)
+        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(mock)
-        result = workflow.execute("CLT-10001")
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
+        result = await workflow.execute("CLT-10001")
 
         assert result.client_id == "CLT-10001"
         assert result.risk_score == "Low"
         assert result.risk_assessment.weighted_score == 0
         assert result.summary.urgency_level == "routine"
 
-    def test_execute_medium_risk_client(self):
+    @pytest.mark.asyncio
+    async def test_execute_medium_risk_client(self):
         cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-20002"]
         sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": "CLT-20002",
                     "risk_score": "Medium", "urgency_level": "elevated"}
-        mock = _build_mock_project_client(cat_resp, sum_resp)
+        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(mock)
-        result = workflow.execute("CLT-20002")
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
+        result = await workflow.execute("CLT-20002")
 
         assert result.client_id == "CLT-20002"
         assert result.risk_score == "Medium"
 
-    def test_execute_high_risk_client(self):
+    @pytest.mark.asyncio
+    async def test_execute_high_risk_client(self):
         cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-30003"]
         sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": "CLT-30003",
                     "risk_score": "High", "urgency_level": "immediate"}
-        mock = _build_mock_project_client(cat_resp, sum_resp)
+        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(mock)
-        result = workflow.execute("CLT-30003")
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
+        result = await workflow.execute("CLT-30003")
 
         assert result.client_id == "CLT-30003"
         assert result.risk_score == "High"
         assert result.risk_assessment.discrepancy_count == 4
 
-    def test_invalid_client_id_raises(self):
-        mock = _build_mock_project_client({}, {})
-        workflow = RiskAssessmentWorkflow(mock)
+    @pytest.mark.asyncio
+    async def test_invalid_client_id_raises(self):
+        cat_agent, sum_agent = _build_mock_agents({}, {})
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
 
         with pytest.raises(InvalidClientIdError):
-            workflow.execute("INVALID")
+            await workflow.execute("INVALID")
 
-    def test_invalid_client_id_empty(self):
-        mock = _build_mock_project_client({}, {})
-        workflow = RiskAssessmentWorkflow(mock)
+    @pytest.mark.asyncio
+    async def test_invalid_client_id_empty(self):
+        cat_agent, sum_agent = _build_mock_agents({}, {})
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
 
         with pytest.raises(InvalidClientIdError):
-            workflow.execute("")
+            await workflow.execute("")
 
-    def test_workflow_calls_agents_sequentially(self):
+    @pytest.mark.asyncio
+    async def test_workflow_calls_agents_sequentially(self):
         cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
         sum_resp = {**SAMPLE_SUMMARY_RESPONSE}
-        mock = _build_mock_project_client(cat_resp, sum_resp)
+        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(mock)
-        workflow.execute("CLT-10001")
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
+        await workflow.execute("CLT-10001")
 
-        openai = mock.get_openai_client()
-        assert openai.responses.create.call_count == 2
+        # Both agents should be called exactly once
+        cat_agent.run.assert_awaited_once()
+        sum_agent.run.assert_awaited_once()
 
-        # First call is categorize, second is summarize
-        calls = openai.responses.create.call_args_list
-        assert calls[0].kwargs["extra_body"]["agent_reference"]["name"] == "CategorizeRiskAgent"
-        assert calls[1].kwargs["extra_body"]["agent_reference"]["name"] == "SummarizeAgent"
+        # Categorize prompt should mention the client ID
+        cat_prompt = cat_agent.run.call_args[0][0]
+        assert "CLT-10001" in cat_prompt
+
+        # Summarize prompt should include the risk assessment JSON
+        sum_prompt = sum_agent.run.call_args[0][0]
+        assert "CLT-10001" in sum_prompt
+        assert "risk_score" in sum_prompt
 
 
 # ── Golden fixture tests (all 5 sample clients) ─────────────────────
@@ -213,6 +210,7 @@ class TestRiskAssessmentWorkflow:
 class TestGoldenFixtures:
     """Validate risk scoring against the expected results from the prompt contracts."""
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("client_id,expected_risk", [
         ("CLT-10001", "Low"),
         ("CLT-20002", "Medium"),
@@ -220,27 +218,17 @@ class TestGoldenFixtures:
         ("CLT-40004", "Low"),
         ("CLT-50005", "High"),
     ])
-    def test_risk_score_matches_expected(self, client_id, expected_risk):
+    async def test_risk_score_matches_expected(self, client_id, expected_risk):
         cat_resp = SAMPLE_CATEGORIZE_RESPONSES[client_id]
         sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": client_id,
                     "risk_score": expected_risk}
-        mock = _build_mock_project_client(cat_resp, sum_resp)
+        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(mock)
-        result = workflow.execute(client_id)
+        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
+        result = await workflow.execute(client_id)
 
-        # The local risk computation from rule_evaluations should match
-        # For CLT-40004: 1 Minor failure = weighted_score 1 → Medium
-        # BUT the contract says CLT-40004 is Low. The sample data has
-        # revenue_decline as a risk_flag but the contract says Low risk.
-        # This means the rule evaluation we created has it as Minor (weight 1)
-        # which puts it at Medium by strict scoring. The contract notes
-        # "Revenue decline within acceptable threshold" so arguably it
-        # shouldn't fail a rule at all. Our test data marks it as failed
-        # with Minor severity, so local calc gives Medium.
-        # We accept the locally-computed score as authoritative.
+        # CLT-40004: 1 Minor failure = weighted_score 1 → Medium by local calc
         if client_id == "CLT-40004":
-            # Our test fixture has 1 Minor failure → weighted=1 → Medium
             assert result.risk_score == "Medium"
         else:
             assert result.risk_score == expected_risk

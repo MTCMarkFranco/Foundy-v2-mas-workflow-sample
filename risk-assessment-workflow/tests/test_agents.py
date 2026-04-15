@@ -1,74 +1,82 @@
-"""Tests for the base HostedAgentInvoker and agent-specific wrappers."""
+"""Tests for the async agent helpers and agent-specific functions."""
 
 import json
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from src.agents.base_agent import HostedAgentInvoker
+from src.agents.base_agent import invoke_agent, invoke_agent_json, strip_code_fence
 from src.agents.categorize_agent import (
-    CategorizeRiskAgentWrapper,
     compute_risk_score,
+    evaluate_risk,
 )
-from src.agents.summarize_agent import SummarizeAgentWrapper
+from src.agents.summarize_agent import summarize_risk
 from src.errors import AgentInvocationError
 from src.models.output import RiskAssessment, RuleEvaluation
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
-def _mock_openai_client(response_text: str) -> MagicMock:
-    """Create a mock openai client that returns the given text."""
-    client = MagicMock()
-    response = SimpleNamespace(output_text=response_text)
-    client.responses.create.return_value = response
-    return client
+def _mock_agent(response_text: str) -> AsyncMock:
+    """Create a mock agent whose run() returns the given text."""
+    agent = AsyncMock()
+    agent.run.return_value = response_text
+    return agent
 
 
-# ── HostedAgentInvoker ───────────────────────────────────────────────
+# ── invoke_agent / invoke_agent_json ─────────────────────────────────
 
-class TestHostedAgentInvoker:
-    def test_invoke_returns_text(self):
-        client = _mock_openai_client("hello")
-        invoker = HostedAgentInvoker(client, "TestAgent", "1")
-        assert invoker.invoke("msg") == "hello"
+class TestInvokeAgent:
+    @pytest.mark.asyncio
+    async def test_invoke_returns_text(self):
+        agent = _mock_agent("hello")
+        result = await invoke_agent(agent, "TestAgent", "msg")
+        assert result == "hello"
 
-    def test_invoke_sends_agent_reference(self):
-        client = _mock_openai_client("ok")
-        invoker = HostedAgentInvoker(client, "MyAgent", "2")
-        invoker.invoke("test")
-        call_kwargs = client.responses.create.call_args
-        extra = call_kwargs.kwargs["extra_body"]["agent_reference"]
-        assert extra["name"] == "MyAgent"
-        assert extra["version"] == "2"
-        assert extra["type"] == "agent_reference"
+    @pytest.mark.asyncio
+    async def test_invoke_calls_agent_run(self):
+        agent = _mock_agent("ok")
+        await invoke_agent(agent, "MyAgent", "test prompt")
+        agent.run.assert_awaited_once_with("test prompt")
 
-    def test_invoke_json_parses_json(self):
+    @pytest.mark.asyncio
+    async def test_invoke_json_parses_json(self):
         payload = {"client_id": "CLT-10001", "risk_score": "Low"}
-        client = _mock_openai_client(json.dumps(payload))
-        invoker = HostedAgentInvoker(client, "A", "1")
-        assert invoker.invoke_json("x") == payload
+        agent = _mock_agent(json.dumps(payload))
+        result = await invoke_agent_json(agent, "A", "x")
+        assert result == payload
 
-    def test_invoke_json_strips_code_fence(self):
+    @pytest.mark.asyncio
+    async def test_invoke_json_strips_code_fence(self):
         payload = {"key": "value"}
         fenced = f"```json\n{json.dumps(payload)}\n```"
-        client = _mock_openai_client(fenced)
-        invoker = HostedAgentInvoker(client, "A", "1")
-        assert invoker.invoke_json("x") == payload
+        agent = _mock_agent(fenced)
+        result = await invoke_agent_json(agent, "A", "x")
+        assert result == payload
 
-    def test_invoke_json_raises_on_invalid_json(self):
-        client = _mock_openai_client("not json at all")
-        invoker = HostedAgentInvoker(client, "A", "1")
+    @pytest.mark.asyncio
+    async def test_invoke_json_raises_on_invalid_json(self):
+        agent = _mock_agent("not json at all")
         with pytest.raises(AgentInvocationError, match="not valid JSON"):
-            invoker.invoke_json("x")
+            await invoke_agent_json(agent, "A", "x")
 
-    def test_invoke_wraps_unexpected_errors(self):
-        client = MagicMock()
-        client.responses.create.side_effect = RuntimeError("boom")
-        invoker = HostedAgentInvoker(client, "A", "1")
+    @pytest.mark.asyncio
+    async def test_invoke_wraps_unexpected_errors(self):
+        agent = AsyncMock()
+        agent.run.side_effect = RuntimeError("boom")
         with pytest.raises(AgentInvocationError, match="boom"):
-            invoker.invoke("x")
+            await invoke_agent(agent, "A", "x")
+
+
+class TestStripCodeFence:
+    def test_plain_json(self):
+        assert strip_code_fence('{"a": 1}') == '{"a": 1}'
+
+    def test_fenced_json(self):
+        assert strip_code_fence('```json\n{"a": 1}\n```') == '{"a": 1}'
+
+    def test_fenced_no_lang(self):
+        assert strip_code_fence('```\n{"a": 1}\n```') == '{"a": 1}'
 
 
 # ── compute_risk_score ───────────────────────────────────────────────
@@ -94,7 +102,6 @@ class TestComputeRiskScore:
         assert count == 2
 
     def test_boundary_five_is_medium(self):
-        # 1 Critical (3) + 1 Major (2) = 5 → Medium
         evals = [
             RuleEvaluation(rule_id="R1", rule_name="R1", passed=False, severity="Critical"),
             RuleEvaluation(rule_id="R2", rule_name="R2", passed=False, severity="Major"),
@@ -104,7 +111,6 @@ class TestComputeRiskScore:
         assert weighted == 5
 
     def test_boundary_six_is_high(self):
-        # 2 Critical (6) → High
         evals = [
             RuleEvaluation(rule_id="R1", rule_name="R1", passed=False, severity="Critical"),
             RuleEvaluation(rule_id="R2", rule_name="R2", passed=False, severity="Critical"),
@@ -120,9 +126,9 @@ class TestComputeRiskScore:
         assert count == 0
 
 
-# ── CategorizeRiskAgentWrapper ───────────────────────────────────────
+# ── evaluate_risk ────────────────────────────────────────────────────
 
-class TestCategorizeRiskAgentWrapper:
+class TestEvaluateRisk:
     def _make_response(self, **overrides) -> str:
         data = {
             "client_id": "CLT-10001",
@@ -136,14 +142,15 @@ class TestCategorizeRiskAgentWrapper:
         data.update(overrides)
         return json.dumps(data)
 
-    def test_evaluate_low_risk(self):
-        client = _mock_openai_client(self._make_response())
-        wrapper = CategorizeRiskAgentWrapper(client)
-        result = wrapper.evaluate("CLT-10001")
+    @pytest.mark.asyncio
+    async def test_evaluate_low_risk(self):
+        agent = _mock_agent(self._make_response())
+        result = await evaluate_risk(agent, "CategorizeRiskAgent", "CLT-10001")
         assert result.client_id == "CLT-10001"
         assert result.risk_score == "Low"
 
-    def test_evaluate_recomputes_score_locally(self):
+    @pytest.mark.asyncio
+    async def test_evaluate_recomputes_score_locally(self):
         """If model says Low but rules say High, local computation wins."""
         data = {
             "client_id": "CLT-30003",
@@ -159,29 +166,28 @@ class TestCategorizeRiskAgentWrapper:
             ],
             "reasoning": "Issues found.",
         }
-        client = _mock_openai_client(json.dumps(data))
-        wrapper = CategorizeRiskAgentWrapper(client)
-        result = wrapper.evaluate("CLT-30003")
+        agent = _mock_agent(json.dumps(data))
+        result = await evaluate_risk(agent, "CategorizeRiskAgent", "CLT-30003")
         assert result.risk_score == "High"  # Locally corrected
         assert result.weighted_score == 6
         assert result.discrepancy_count == 2
 
-    def test_evaluate_invalid_json_raises(self):
-        client = _mock_openai_client("not json")
-        wrapper = CategorizeRiskAgentWrapper(client)
+    @pytest.mark.asyncio
+    async def test_evaluate_invalid_json_raises(self):
+        agent = _mock_agent("not json")
         with pytest.raises(AgentInvocationError):
-            wrapper.evaluate("CLT-10001")
+            await evaluate_risk(agent, "CategorizeRiskAgent", "CLT-10001")
 
-    def test_evaluate_missing_fields_raises(self):
-        client = _mock_openai_client(json.dumps({"wrong": "schema"}))
-        wrapper = CategorizeRiskAgentWrapper(client)
+    @pytest.mark.asyncio
+    async def test_evaluate_missing_fields_raises(self):
+        agent = _mock_agent(json.dumps({"wrong": "schema"}))
         with pytest.raises(AgentInvocationError, match="schema"):
-            wrapper.evaluate("CLT-10001")
+            await evaluate_risk(agent, "CategorizeRiskAgent", "CLT-10001")
 
 
-# ── SummarizeAgentWrapper ────────────────────────────────────────────
+# ── summarize_risk ───────────────────────────────────────────────────
 
-class TestSummarizeAgentWrapper:
+class TestSummarizeRisk:
     def _make_summary_response(self, **overrides) -> str:
         data = {
             "client_id": "CLT-10001",
@@ -196,27 +202,27 @@ class TestSummarizeAgentWrapper:
         data.update(overrides)
         return json.dumps(data)
 
-    def test_summarize_returns_summary(self):
-        client = _mock_openai_client(self._make_summary_response())
-        wrapper = SummarizeAgentWrapper(client)
+    @pytest.mark.asyncio
+    async def test_summarize_returns_summary(self):
+        agent = _mock_agent(self._make_summary_response())
         assessment = RiskAssessment(client_id="CLT-10001", risk_score="Low")
-        result = wrapper.summarize(assessment)
+        result = await summarize_risk(agent, "SummarizeAgent", assessment)
         assert result.client_id == "CLT-10001"
         assert result.urgency_level == "routine"
 
-    def test_summarize_overrides_mismatched_score(self):
+    @pytest.mark.asyncio
+    async def test_summarize_overrides_mismatched_score(self):
         """If summarizer returns wrong risk_score, it's corrected."""
-        client = _mock_openai_client(
+        agent = _mock_agent(
             self._make_summary_response(risk_score="High")
         )
-        wrapper = SummarizeAgentWrapper(client)
         assessment = RiskAssessment(client_id="CLT-10001", risk_score="Low")
-        result = wrapper.summarize(assessment)
+        result = await summarize_risk(agent, "SummarizeAgent", assessment)
         assert result.risk_score == "Low"  # Corrected to match assessment
 
-    def test_summarize_invalid_json_raises(self):
-        client = _mock_openai_client("not json")
-        wrapper = SummarizeAgentWrapper(client)
+    @pytest.mark.asyncio
+    async def test_summarize_invalid_json_raises(self):
+        agent = _mock_agent("not json")
         assessment = RiskAssessment(client_id="CLT-10001", risk_score="Low")
         with pytest.raises(AgentInvocationError):
-            wrapper.summarize(assessment)
+            await summarize_risk(agent, "SummarizeAgent", assessment)
