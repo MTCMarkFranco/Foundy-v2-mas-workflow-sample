@@ -43,18 +43,25 @@ text = result.text  # AgentResponse.text returns the string
 
 > **Important**: `FoundryAgent.run()` returns an `AgentResponse` object, not a plain `str`. Access `.text` for the response string.
 
-### Dependency Injection & Testability
+### Sequential Workflow with SequentialBuilder
 
-The orchestrator accepts any object matching the `AgentRunnable` protocol (anything with an async `run(str)` method). This allows injecting `AsyncMock` in tests:
+The orchestrator uses MAF's `SequentialBuilder` to chain agents:
 
 ```python
-class AgentRunnable(Protocol):
-    async def run(self, user_message: str) -> Any: ...
+from agent_framework.orchestrations import SequentialBuilder
+
+workflow = SequentialBuilder(
+    participants=[categorize_agent, summarize_agent],
+    chain_only_agent_responses=True,
+).build()
+
+result = await workflow.run(prompt)
+outputs = result.get_outputs()  # list of Message lists
 ```
 
-### Local Deterministic Risk Scoring
-
-The `compute_risk_score()` function locally recomputes risk scores from rule evaluations, overriding whatever the model returns. This ensures deterministic, auditable scoring.
+- `chain_only_agent_responses=True` ensures only agent responses are passed between stages (not the original user prompt)
+- A fresh workflow is built per execution to prevent conversation state leakage
+- Assistant messages are extracted by role from `get_outputs()` and parsed as JSON
 
 ### Authentication
 
@@ -121,16 +128,14 @@ risk-assessment-workflow/
 │   ├── config.py             # Dataclass config from env vars
 │   ├── errors.py             # Exception hierarchy + retry_with_backoff
 │   ├── agents/
-│   │   ├── base_agent.py     # AgentRunnable protocol + invoke_agent/invoke_agent_json helpers
-│   │   ├── categorize_agent.py  # evaluate_risk() + local compute_risk_score()
-│   │   └── summarize_agent.py   # summarize_risk() with consistency enforcement
+│   │   └── base_agent.py     # strip_code_fence() helper for JSON parsing
 │   ├── workflow/
-│   │   ├── orchestrator.py   # RiskAssessmentWorkflow (async, dependency-injected agents)
-│   │   └── context.py        # Agent handoff helpers
+│   │   ├── orchestrator.py   # RiskAssessmentWorkflow (MAF SequentialBuilder)
+│   │   └── context.py        # build_workflow_result helper
 │   └── models/
 │       ├── input.py          # WorkflowInput with CLT-XXXXX validation
 │       └── output.py         # RiskAssessment, SummaryOutput, WorkflowResult
-├── tests/                    # pytest + pytest-asyncio with AsyncMock agents
+├── tests/                    # pytest + pytest-asyncio, mocks SequentialBuilder
 ├── scripts/
 │   ├── create_agents.py      # One-time: create prompt agents in Foundry
 │   └── create_search_index.py # One-time: create AI Search index + upload sample data

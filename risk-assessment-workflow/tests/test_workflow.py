@@ -1,35 +1,45 @@
-"""Tests for the workflow orchestrator and end-to-end flow."""
+"""Tests for the workflow orchestrator using MAF SequentialBuilder."""
 
 import json
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.config import Config
-from src.errors import InvalidClientIdError, WorkflowError
+from src.errors import AgentInvocationError, InvalidClientIdError, WorkflowError
 from src.workflow.orchestrator import RiskAssessmentWorkflow
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
-# Sample responses matching the 5 test clients from sample-data
+def _make_message(role: str, text: str):
+    """Create a mock Message-like object."""
+    return SimpleNamespace(role=role, text=text)
+
+
+def _make_workflow_run_result(categorize_json: dict, summary_json: dict):
+    """Create a mock WorkflowRunResult with get_outputs() returning messages."""
+    messages = [
+        _make_message("user", "Evaluate risk..."),
+        _make_message("assistant", json.dumps(categorize_json)),
+        _make_message("assistant", json.dumps(summary_json)),
+    ]
+    result = MagicMock()
+    result.get_outputs.return_value = [messages]
+    return result
+
+
+# Sample agent responses for each test client
 SAMPLE_CATEGORIZE_RESPONSES = {
     "CLT-10001": {
         "client_id": "CLT-10001",
         "risk_score": "Low",
         "weighted_score": 0,
         "discrepancy_count": 0,
-        "search_results": [
-            {"document_id": "CLT-10001-DOC-001", "relevance_score": 0.98,
-             "content_summary": "KYC verified", "fields": {}},
-            {"document_id": "CLT-10001-DOC-002", "relevance_score": 0.95,
-             "content_summary": "Clean financials", "fields": {}},
-        ],
+        "search_results": [],
         "rule_evaluations": [
             {"rule_id": "C1", "rule_name": "Compliance docs", "passed": True,
              "severity": "Critical", "details": "All present"},
-            {"rule_id": "C2", "rule_name": "Dates current", "passed": True,
-             "severity": "Critical", "details": "All current"},
         ],
         "reasoning": "All documents current, no risk flags.",
     },
@@ -58,12 +68,8 @@ SAMPLE_CATEGORIZE_RESPONSES = {
              "severity": "Critical", "details": "KYC expired"},
             {"rule_id": "C5", "rule_name": "Watchlist", "passed": False,
              "severity": "Critical", "details": "Regulatory investigation"},
-            {"rule_id": "D4", "rule_name": "Stale data", "passed": False,
-             "severity": "Major", "details": "Review overdue"},
-            {"rule_id": "D3", "rule_name": "Conflicts", "passed": False,
-             "severity": "Major", "details": "Adverse media"},
         ],
-        "reasoning": "Critical compliance issues: expired KYC, adverse media.",
+        "reasoning": "Critical compliance issues.",
     },
     "CLT-40004": {
         "client_id": "CLT-40004",
@@ -72,8 +78,6 @@ SAMPLE_CATEGORIZE_RESPONSES = {
         "discrepancy_count": 1,
         "search_results": [],
         "rule_evaluations": [
-            {"rule_id": "C1", "rule_name": "Compliance docs", "passed": True,
-             "severity": "Critical", "details": "Present"},
             {"rule_id": "D1", "rule_name": "Revenue flag", "passed": False,
              "severity": "Minor", "details": "Revenue decline noted"},
         ],
@@ -89,17 +93,13 @@ SAMPLE_CATEGORIZE_RESPONSES = {
             {"rule_id": "C5", "rule_name": "Jurisdiction risk", "passed": False,
              "severity": "Critical", "details": "High-risk jurisdiction"},
             {"rule_id": "D5", "rule_name": "Transaction pattern", "passed": False,
-             "severity": "Critical", "details": "Unusual transactions $4.2M"},
-            {"rule_id": "D3", "rule_name": "Complexity", "passed": False,
-             "severity": "Major", "details": "Complex multi-jurisdictional ownership"},
-            {"rule_id": "C5", "rule_name": "Cash movements", "passed": False,
-             "severity": "Major", "details": "Large cash movements"},
+             "severity": "Critical", "details": "Unusual transactions"},
         ],
-        "reasoning": "High-risk jurisdiction, unusual transactions, complex ownership.",
+        "reasoning": "High-risk jurisdiction, unusual transactions.",
     },
 }
 
-SAMPLE_SUMMARY_RESPONSE = {
+SAMPLE_SUMMARY = {
     "client_id": "CLT-10001",
     "risk_score": "Low",
     "summary_markdown": "## Risk Assessment\n\n**Risk**: Low",
@@ -111,15 +111,19 @@ SAMPLE_SUMMARY_RESPONSE = {
 }
 
 
-def _build_mock_agents(categorize_resp: dict, summarize_resp: dict):
-    """Build mock FoundryAgent instances with staged responses."""
-    categorize_agent = AsyncMock()
-    categorize_agent.run.return_value = json.dumps(categorize_resp)
+def _patch_sequential_builder(categorize_json: dict, summary_json: dict):
+    """Return a patch context manager that mocks SequentialBuilder."""
+    mock_result = _make_workflow_run_result(categorize_json, summary_json)
 
-    summarize_agent = AsyncMock()
-    summarize_agent.run.return_value = json.dumps(summarize_resp)
+    mock_workflow = AsyncMock()
+    mock_workflow.run = AsyncMock(return_value=mock_result)
 
-    return categorize_agent, summarize_agent
+    mock_builder = MagicMock()
+    mock_builder.return_value.build.return_value = mock_workflow
+
+    return patch(
+        "src.workflow.orchestrator.SequentialBuilder", mock_builder
+    )
 
 
 # ── Workflow tests ───────────────────────────────────────────────────
@@ -127,88 +131,150 @@ def _build_mock_agents(categorize_resp: dict, summarize_resp: dict):
 class TestRiskAssessmentWorkflow:
     @pytest.mark.asyncio
     async def test_execute_low_risk_client(self):
-        cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
-        sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": "CLT-10001", "risk_score": "Low"}
-        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY, "client_id": "CLT-10001", "risk_score": "Low"}
 
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-        result = await workflow.execute("CLT-10001")
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-10001")
 
         assert result.client_id == "CLT-10001"
         assert result.risk_score == "Low"
-        assert result.risk_assessment.weighted_score == 0
         assert result.summary.urgency_level == "routine"
 
     @pytest.mark.asyncio
     async def test_execute_medium_risk_client(self):
-        cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-20002"]
-        sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": "CLT-20002",
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-20002"]
+        summary = {**SAMPLE_SUMMARY, "client_id": "CLT-20002",
                     "risk_score": "Medium", "urgency_level": "elevated"}
-        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-        result = await workflow.execute("CLT-20002")
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-20002")
 
         assert result.client_id == "CLT-20002"
         assert result.risk_score == "Medium"
 
     @pytest.mark.asyncio
     async def test_execute_high_risk_client(self):
-        cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-30003"]
-        sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": "CLT-30003",
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-30003"]
+        summary = {**SAMPLE_SUMMARY, "client_id": "CLT-30003",
                     "risk_score": "High", "urgency_level": "immediate"}
-        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-        result = await workflow.execute("CLT-30003")
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-30003")
 
         assert result.client_id == "CLT-30003"
         assert result.risk_score == "High"
-        assert result.risk_assessment.discrepancy_count == 4
 
     @pytest.mark.asyncio
     async def test_invalid_client_id_raises(self):
-        cat_agent, sum_agent = _build_mock_agents({}, {})
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-
+        wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
         with pytest.raises(InvalidClientIdError):
-            await workflow.execute("INVALID")
+            await wf.execute("INVALID")
 
     @pytest.mark.asyncio
     async def test_invalid_client_id_empty(self):
-        cat_agent, sum_agent = _build_mock_agents({}, {})
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-
+        wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
         with pytest.raises(InvalidClientIdError):
-            await workflow.execute("")
+            await wf.execute("")
 
     @pytest.mark.asyncio
-    async def test_workflow_calls_agents_sequentially(self):
-        cat_resp = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
-        sum_resp = {**SAMPLE_SUMMARY_RESPONSE}
-        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
+    async def test_builds_fresh_workflow_per_call(self):
+        """Verify SequentialBuilder is called each time (no state leakage)."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY}
 
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-        await workflow.execute("CLT-10001")
+        with _patch_sequential_builder(cat, summary) as mock_builder:
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            await wf.execute("CLT-10001")
+            await wf.execute("CLT-10001")
 
-        # Both agents should be called exactly once
-        cat_agent.run.assert_awaited_once()
-        sum_agent.run.assert_awaited_once()
+            assert mock_builder.call_count == 2
 
-        # Categorize prompt should mention the client ID
-        cat_prompt = cat_agent.run.call_args[0][0]
-        assert "CLT-10001" in cat_prompt
+    @pytest.mark.asyncio
+    async def test_chain_only_agent_responses_enabled(self):
+        """Verify SequentialBuilder is created with chain_only_agent_responses=True."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY}
 
-        # Summarize prompt should include the risk assessment JSON
-        sum_prompt = sum_agent.run.call_args[0][0]
-        assert "CLT-10001" in sum_prompt
-        assert "risk_score" in sum_prompt
+        with _patch_sequential_builder(cat, summary) as mock_builder:
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            await wf.execute("CLT-10001")
+
+            call_kwargs = mock_builder.call_args[1]
+            assert call_kwargs["chain_only_agent_responses"] is True
+
+    @pytest.mark.asyncio
+    async def test_summary_risk_score_corrected_to_match_assessment(self):
+        """If summarizer returns wrong risk_score, it's corrected."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]  # risk_score: Low
+        summary = {**SAMPLE_SUMMARY, "risk_score": "High"}  # Wrong!
+
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-10001")
+
+        assert result.risk_score == "Low"  # Corrected by consistency check
+        assert result.summary.risk_score == "Low"
+
+    @pytest.mark.asyncio
+    async def test_insufficient_outputs_raises(self):
+        """If workflow returns fewer than 2 assistant messages, raise."""
+        messages = [_make_message("user", "test")]
+        mock_result = MagicMock()
+        mock_result.get_outputs.return_value = [messages]
+
+        mock_workflow = AsyncMock()
+        mock_workflow.run = AsyncMock(return_value=mock_result)
+
+        mock_builder = MagicMock()
+        mock_builder.return_value.build.return_value = mock_workflow
+
+        with patch("src.workflow.orchestrator.SequentialBuilder", mock_builder):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            with pytest.raises(WorkflowError, match="Expected 2 assistant"):
+                await wf.execute("CLT-10001")
+
+    @pytest.mark.asyncio
+    async def test_invalid_assessment_json_raises(self):
+        """If CategorizeRiskAgent returns invalid JSON, raise."""
+        messages = [
+            _make_message("user", "test"),
+            _make_message("assistant", "not json"),
+            _make_message("assistant", json.dumps(SAMPLE_SUMMARY)),
+        ]
+        mock_result = MagicMock()
+        mock_result.get_outputs.return_value = [messages]
+
+        mock_workflow = AsyncMock()
+        mock_workflow.run = AsyncMock(return_value=mock_result)
+
+        mock_builder = MagicMock()
+        mock_builder.return_value.build.return_value = mock_workflow
+
+        with patch("src.workflow.orchestrator.SequentialBuilder", mock_builder):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            with pytest.raises(AgentInvocationError, match="CategorizeRiskAgent"):
+                await wf.execute("CLT-10001")
+
+    @pytest.mark.asyncio
+    async def test_client_id_mismatch_raises(self):
+        """If assessment client_id doesn't match input, raise."""
+        cat = {**SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"], "client_id": "CLT-99999"}
+        summary = {**SAMPLE_SUMMARY}
+
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            with pytest.raises(AgentInvocationError, match="client_id mismatch"):
+                await wf.execute("CLT-10001")
 
 
 # ── Golden fixture tests (all 5 sample clients) ─────────────────────
 
 class TestGoldenFixtures:
-    """Validate risk scoring against the expected results from the prompt contracts."""
+    """Validate risk scoring matches model output (no local override)."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("client_id,expected_risk", [
@@ -219,16 +285,12 @@ class TestGoldenFixtures:
         ("CLT-50005", "High"),
     ])
     async def test_risk_score_matches_expected(self, client_id, expected_risk):
-        cat_resp = SAMPLE_CATEGORIZE_RESPONSES[client_id]
-        sum_resp = {**SAMPLE_SUMMARY_RESPONSE, "client_id": client_id,
+        cat = SAMPLE_CATEGORIZE_RESPONSES[client_id]
+        summary = {**SAMPLE_SUMMARY, "client_id": client_id,
                     "risk_score": expected_risk}
-        cat_agent, sum_agent = _build_mock_agents(cat_resp, sum_resp)
 
-        workflow = RiskAssessmentWorkflow(cat_agent, sum_agent)
-        result = await workflow.execute(client_id)
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute(client_id)
 
-        # CLT-40004: 1 Minor failure = weighted_score 1 → Medium by local calc
-        if client_id == "CLT-40004":
-            assert result.risk_score == "Medium"
-        else:
-            assert result.risk_score == expected_risk
+        assert result.risk_score == expected_risk

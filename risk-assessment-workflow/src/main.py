@@ -34,7 +34,7 @@ def _create_foundry_agents(config: Config):
 
 
 async def run_workflow(client_id: str, config: Config, output_json: bool = False) -> int:
-    """Execute the risk assessment workflow asynchronously."""
+    """Execute the risk assessment workflow via MAF SequentialBuilder."""
     from src.workflow.orchestrator import RiskAssessmentWorkflow
 
     try:
