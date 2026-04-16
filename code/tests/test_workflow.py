@@ -277,6 +277,90 @@ class TestRiskAssessmentWorkflow:
             with pytest.raises(AgentInvocationError, match="client_id mismatch"):
                 await wf.execute("CLT-10001")
 
+    @pytest.mark.asyncio
+    async def test_stage_metrics_populated(self):
+        """Verify stage_metrics are populated with agent names."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY, "client_id": "CLT-10001", "risk_score": "Low"}
+
+        with _patch_sequential_builder(cat, summary):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-10001")
+
+        assert len(result.stage_metrics) == 2
+        assert result.stage_metrics[0].agent_name == "CategorizeRiskAgent"
+        assert result.stage_metrics[1].agent_name == "SummarizeAgent"
+
+    @pytest.mark.asyncio
+    async def test_token_usage_extracted_when_available(self):
+        """Verify token usage is captured from message metadata."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY, "client_id": "CLT-10001", "risk_score": "Low"}
+
+        # Create messages with token_usage metadata
+        cat_msg = SimpleNamespace(
+            role="assistant", text=json.dumps(cat),
+            token_usage=SimpleNamespace(
+                prompt_tokens=500, completion_tokens=200, total_tokens=700
+            ),
+        )
+        sum_msg = SimpleNamespace(
+            role="assistant", text=json.dumps(summary),
+            token_usage=SimpleNamespace(
+                prompt_tokens=800, completion_tokens=300, total_tokens=1100
+            ),
+        )
+        user_msg = SimpleNamespace(role="user", text="Evaluate risk...")
+
+        mock_result = MagicMock()
+        mock_result.get_outputs.return_value = [[user_msg, cat_msg, sum_msg]]
+
+        mock_workflow = AsyncMock()
+        mock_workflow.run = AsyncMock(return_value=mock_result)
+
+        mock_builder = MagicMock()
+        mock_builder.return_value.build.return_value = mock_workflow
+
+        with patch("src.workflow.orchestrator.SequentialBuilder", mock_builder):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-10001")
+
+        assert result.stage_metrics[0].token_usage.total_tokens == 700
+        assert result.stage_metrics[1].token_usage.total_tokens == 1100
+        assert result.total_token_usage.total_tokens == 1800
+
+    @pytest.mark.asyncio
+    async def test_reasoning_extracted_when_available(self):
+        """Verify reasoning is captured from message metadata."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY, "client_id": "CLT-10001", "risk_score": "Low"}
+
+        cat_msg = SimpleNamespace(
+            role="assistant", text=json.dumps(cat),
+            reasoning="I checked all compliance rules and found zero violations.",
+        )
+        sum_msg = SimpleNamespace(
+            role="assistant", text=json.dumps(summary),
+            reasoning="Based on the low risk score, I produced a routine summary.",
+        )
+        user_msg = SimpleNamespace(role="user", text="Evaluate risk...")
+
+        mock_result = MagicMock()
+        mock_result.get_outputs.return_value = [[user_msg, cat_msg, sum_msg]]
+
+        mock_workflow = AsyncMock()
+        mock_workflow.run = AsyncMock(return_value=mock_result)
+
+        mock_builder = MagicMock()
+        mock_builder.return_value.build.return_value = mock_workflow
+
+        with patch("src.workflow.orchestrator.SequentialBuilder", mock_builder):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock())
+            result = await wf.execute("CLT-10001")
+
+        assert "zero violations" in result.stage_metrics[0].reasoning
+        assert "routine summary" in result.stage_metrics[1].reasoning
+
 
 # ── Golden fixture tests (all 5 sample clients) ─────────────────────
 

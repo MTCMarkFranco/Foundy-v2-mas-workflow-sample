@@ -294,10 +294,10 @@ MAX_CONCURRENT_REQUESTS=5          # Parallel execution slots
 | 5 | **Separation of Concerns** | 50% | 🟢 Improved | Resilience layer separated from errors and orchestration |
 | 6 | **Fast Failures** | 50% | 🟢 Improved | asyncio.wait_for() enforced; deadline bounds retries |
 | 7 | **Circuit Breaker** | 35% | 🟢 Implemented | Full state machine; integrated into retry flow |
-| 8 | **Token Economics** | 0% | 🔴 Missing | MAF does not expose token counts |
-| 9 | **Graceful Degradation** | 10% | 🔴 Minimal | Limiter available; no queue/rejection at API level |
-| 10 | **Observability** | 30% | 🟢 Improved | Correlation IDs, durations, state transitions logged |
-| | **Overall** | **34%** | | +16% from baseline (18%) |
+| 8 | **Token Economics** | 25% | 🟡 Partial | AgentResponse.token_usage extracted per stage; APIM recommended for budget enforcement |
+| 9 | **Graceful Degradation** | 20% | 🟡 Partial | Circuit breaker + limiter locally; APIM AI Gateway recommended for 429/backend-pool failover |
+| 10 | **Observability** | 50% | 🟢 Improved | Correlation IDs, durations, token usage, reasoning traces captured; APIM + Log Analytics recommended for full pipeline |
+| | **Overall** | **39%** | | +5% from previous (34%) |
 
 ---
 
@@ -308,11 +308,149 @@ These items require infrastructure or framework changes beyond the current codeb
 | Gap | Required For | Dependency |
 |-----|-------------|------------|
 | Per-client actor mailbox | Isolation (100%), Determinism (100%) | Actor framework (e.g., Orleans, Dapr) or custom async queue per client_id |
-| AI Gateway (APIM) | Token Economics, Graceful Degradation | Azure API Management with `azure-openai-token-limit` policy |
-| Token budget tracking | Token Economics (100%) | MAF or Azure SDK exposing `usage.total_tokens` in response metadata |
-| OpenTelemetry export | Observability (100%) | `opentelemetry-sdk` + Azure Monitor exporter |
+| AI Gateway (APIM) deployment | Token Economics (100%), Graceful Degradation (100%) | Azure API Management with `azure-openai-token-limit` policy, backend pools, and 429 failover |
+| Token budget enforcement | Token Economics (100%) | APIM token rate-limiting policies + local threshold alerts from `AgentResponse.token_usage` |
+| OpenTelemetry export | Observability (100%) | `opentelemetry-sdk` + Azure Monitor exporter to Log Analytics workspace |
+| Reasoning traces to Log Analytics | Observability (100%) | Foundry v2 SDK telemetry pipeline → Log Analytics workspace |
 | Request queuing with backpressure | Graceful Degradation (100%) | Service layer (FastAPI / Azure Functions) with bounded queue |
 | Supervision tree | Supervision (100%) | Hierarchical error escalation with restart strategies |
+
+---
+
+### G-ACTOR-007: Token Economics (Usage Tracking & Budget Awareness)
+
+**Objective**: Capture token consumption per agent call to enable cost visibility, throttling decisions, and budget enforcement.
+
+**Rationale**: Without token usage visibility, there is no way to detect runaway prompts, set per-client budgets, or decide when to throttle. The MAF `AgentResponse` object exposes `.token_usage` with `prompt_tokens`, `completion_tokens`, and `total_tokens`. This data must be captured, logged, and surfaced to operators.
+
+**What's Implemented (Local)**:
+- `AgentStageMetrics` model captures `TokenUsage` per agent stage in `src/models/output.py`
+- `_extract_stage_metrics()` in `orchestrator.py` reads `token_usage` from MAF `AgentResponse` messages
+- Token counts logged per-stage with correlation ID at INFO level
+- CLI displays token usage summary panel when data is available
+- `WorkflowResult.total_token_usage` aggregates across all stages
+
+**What Requires AI Gateway (APIM) for Full Coverage**:
+- **Token rate limiting**: APIM `azure-openai-token-limit` policy enforces per-minute/per-hour token budgets at the gateway level
+- **Budget alerting**: APIM metrics emit token counts to Azure Monitor; alert rules trigger when thresholds are approached
+- **Cross-request aggregation**: Individual requests know their own usage, but only an API gateway can aggregate across all consumers
+- **Throttling decisions**: When to apply backpressure is a gateway-level concern — the local orchestrator provides the data, APIM enforces the policy
+
+**Success Criteria**:
+- [x] `TokenUsage` Pydantic model with `prompt_tokens`, `completion_tokens`, `total_tokens`
+- [x] `AgentStageMetrics` captures per-agent `TokenUsage` and reasoning
+- [x] Token usage extracted from `AgentResponse` message metadata
+- [x] Token counts logged with correlation ID
+- [x] CLI displays token usage summary
+- [ ] (Future) APIM `azure-openai-token-limit` policy deployed
+- [ ] (Future) Azure Monitor alerts on token budget thresholds
+
+**Implementation Reference**: `src/models/output.py` → `TokenUsage`, `AgentStageMetrics`; `src/workflow/orchestrator.py` → `_extract_stage_metrics()`; `src/main.py` → `_display_token_usage()`.
+
+---
+
+### G-ACTOR-008: Graceful Degradation (AI Gateway)
+
+**Objective**: Handle HTTP 429 (rate limiting), backend failures, and capacity exhaustion gracefully using an AI Gateway (Azure API Management) in front of Foundry endpoints.
+
+**Rationale**: The local circuit breaker and retry logic protect against transient failures at the orchestrator level, but production deployments need gateway-level protection. An AI Gateway like Azure API Management provides multiple modalities for graceful degradation that the local orchestrator cannot implement alone.
+
+**Degradation Modalities via APIM AI Gateway**:
+
+| Modality | APIM Policy | Behavior |
+|----------|-------------|----------|
+| **Token rate limiting** | `azure-openai-token-limit` | Reject requests before they hit the LLM when token budget is exhausted |
+| **HTTP 429 handling** | `retry` + `Retry-After` header | Respect backend rate limits; propagate `Retry-After` to callers |
+| **Backend pool failover** | `set-backend-service` + `choose` | Route to alternate Foundry endpoints or model deployments when primary returns 429/5xx |
+| **Request queuing** | External queue (Service Bus) | Buffer excess requests instead of rejecting them outright |
+| **Circuit breaker** | `choose` + context variables | Gateway-level circuit breaker complements local breaker for cascading protection |
+| **Cached fallback** | `cache-lookup` / `cache-store` | Return cached risk assessments for recently-evaluated clients during outages |
+| **Graceful error response** | `return-response` | Return informative error with retry guidance instead of raw 429/503 |
+
+**Architecture — APIM as AI Gateway**:
+
+```
+┌──────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+│  Client   │────▶│  Azure API Mgmt     │────▶│  Foundry Endpoint   │
+│  (CLI /   │     │  (AI Gateway)       │     │  (Primary)          │
+│  Service) │     │                     │     └─────────────────────┘
+└──────────┘     │  • Token rate limit  │              │
+                 │  • 429 → Retry-After │     ┌────────▼────────────┐
+                 │  • Backend failover  │────▶│  Foundry Endpoint   │
+                 │  • Circuit breaker   │     │  (Secondary/Backup) │
+                 │  • Request logging   │     └─────────────────────┘
+                 └─────────────────────┘
+```
+
+**Success Criteria**:
+- [x] Local circuit breaker protects against cascading failures
+- [x] Local retry with classified failure handling
+- [ ] (Future) APIM deployed as AI Gateway in front of Foundry endpoint
+- [ ] (Future) `azure-openai-token-limit` policy configured
+- [ ] (Future) Backend pool with primary + secondary Foundry endpoints
+- [ ] (Future) 429 responses handled with `Retry-After` propagation
+
+**Implementation Reference**: Local resilience in `src/resilience.py`; APIM deployment is infrastructure-level (see `WORKFLOW-ARCHITECTURE.md` AI Gateway section).
+
+---
+
+### G-ACTOR-009: Observability Pipeline (Reasoning, Tokens, Telemetry)
+
+**Objective**: Capture the full observability surface — token usage, agent reasoning traces, and workflow telemetry — and route it through a pipeline from the local orchestrator → Foundry v2 project → Log Analytics workspace.
+
+**Rationale**: Production AI systems require visibility into *what the model thought* (reasoning), *how much it cost* (tokens), and *how it performed* (latency, errors). The observability pipeline has three tiers:
+
+1. **Local CLI** — Immediate developer feedback (reasoning in magenta, token usage panel)
+2. **Foundry v2 Project** — Agent telemetry sent via SDK for project-level dashboards
+3. **Log Analytics Workspace** — Long-term storage for cross-project analytics and alerting
+
+**Tier 1: Local CLI (Implemented)**:
+- Reasoning traces displayed in `dim magenta` via `--verbose` flag
+- Token usage summary panel displayed after every run
+- Correlation IDs in structured log output
+- Duration tracking per workflow execution
+
+**Tier 2: APIM Gateway Observability**:
+- Request/response logging via APIM diagnostic settings
+- Token consumption metrics emitted to Azure Monitor
+- Prompt content (optionally) captured for audit trails
+- Latency percentiles per agent endpoint
+
+**Tier 3: Foundry v2 → Log Analytics Pipeline**:
+- Foundry v2 SDK captures agent invocation telemetry within the project
+- Project diagnostic settings route telemetry to a Log Analytics workspace
+- Reasoning traces (returned as separate property on `AgentResponse`) are:
+  1. Extracted by the orchestrator (`_extract_stage_metrics()`)
+  2. Displayed locally (CLI)
+  3. Logged with correlation ID (structured logging)
+  4. (Future) Sent to Foundry project via SDK telemetry
+  5. (Future) Routed to Log Analytics for long-term analysis
+
+**Reasoning Capture Architecture**:
+
+```
+AgentResponse
+  ├── .text          → JSON output (parsed by orchestrator)
+  ├── .reasoning     → Chain-of-thought trace (captured by _extract_stage_metrics)
+  └── .token_usage   → Token counts (captured by _extract_stage_metrics)
+         │
+         ├──▶ CLI: dim magenta panel (--verbose)
+         ├──▶ Structured log: [WORKFLOW:{id}] reasoning: ...
+         ├──▶ (Future) Foundry v2 project telemetry
+         └──▶ (Future) Log Analytics workspace
+```
+
+**Success Criteria**:
+- [x] Reasoning extracted from `AgentResponse` message metadata
+- [x] Reasoning displayed in CLI with distinct color (dim magenta)
+- [x] Token usage logged per stage with correlation ID
+- [x] `--verbose` flag enables reasoning display
+- [x] `ENABLE_REASONING_DISPLAY` env var for config
+- [ ] (Future) APIM diagnostic settings configured
+- [ ] (Future) Foundry v2 SDK telemetry integration
+- [ ] (Future) Log Analytics workspace receiving reasoning + token data
+
+**Implementation Reference**: `src/workflow/orchestrator.py` → `_extract_stage_metrics()`; `src/main.py` → `_display_reasoning()`, `_display_token_usage()`; `src/config.py` → `enable_reasoning_display`.
 
 ---
 
@@ -359,3 +497,9 @@ These items require infrastructure or framework changes beyond the current codeb
 | Transient retry in workflow succeeds | `test_workflow.py` | G-ACTOR-003 |
 | Concurrency limiter rejects when full | `test_resilience.py` | G-ACTOR-005 |
 | Fresh builder per execute() call | `test_workflow.py` | G-ACTOR-004 |
+| Stage metrics populated with agent names | `test_workflow.py` | G-ACTOR-007, G-ACTOR-009 |
+| Token usage extracted from message metadata | `test_workflow.py` | G-ACTOR-007 |
+| Reasoning extracted from message metadata | `test_workflow.py` | G-ACTOR-009 |
+| TokenUsage model defaults and values | `test_models.py` | G-ACTOR-007 |
+| AgentStageMetrics model with reasoning | `test_models.py` | G-ACTOR-009 |
+| WorkflowResult total_token_usage aggregation | `test_models.py` | G-ACTOR-007 |

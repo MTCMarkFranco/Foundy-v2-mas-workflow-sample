@@ -8,6 +8,25 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+# --- Token Usage ---
+
+class TokenUsage(BaseModel):
+    """Token consumption metrics for a single agent invocation."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class AgentStageMetrics(BaseModel):
+    """Metrics captured from a single agent stage execution."""
+
+    agent_name: str
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    reasoning: str = ""
+    duration_seconds: float = 0.0
+
+
 # --- CategorizeRiskAgent output ---
 
 class SearchResult(BaseModel):
@@ -76,3 +95,13 @@ class WorkflowResult(BaseModel):
     risk_assessment: RiskAssessment
     summary: SummaryOutput
     completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    stage_metrics: list[AgentStageMetrics] = Field(default_factory=list)
+
+    @property
+    def total_token_usage(self) -> TokenUsage:
+        """Aggregate token usage across all agent stages."""
+        return TokenUsage(
+            prompt_tokens=sum(m.token_usage.prompt_tokens for m in self.stage_metrics),
+            completion_tokens=sum(m.token_usage.completion_tokens for m in self.stage_metrics),
+            total_tokens=sum(m.token_usage.total_tokens for m in self.stage_metrics),
+        )

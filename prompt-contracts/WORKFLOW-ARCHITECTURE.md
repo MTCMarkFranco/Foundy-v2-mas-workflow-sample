@@ -396,6 +396,63 @@ response = openai_client.responses.create(
 
 ---
 
+## AI Gateway (Azure API Management)
+
+For production deployments, an **AI Gateway** layer (Azure API Management) should sit between the local orchestrator and the Foundry endpoints. This provides capabilities that the local orchestrator cannot implement alone.
+
+### Architecture
+
+```
+┌──────────────────┐     ┌─────────────────────────────┐     ┌─────────────────────┐
+│  Local           │     │  Azure API Management        │     │  Azure AI Foundry   │
+│  Orchestrator    │────▶│  (AI Gateway)                │────▶│  (Primary Endpoint) │
+│                  │     │                              │     └─────────────────────┘
+│  • Circuit       │     │  • Token rate limiting       │              │
+│    breaker       │     │  • 429 → Retry-After         │     ┌────────▼────────────┐
+│  • Retry logic   │     │  • Backend pool failover     │────▶│  Azure AI Foundry   │
+│  • Timeout       │     │  • Request/response logging  │     │  (Backup Endpoint)  │
+│    enforcement   │     │  • Diagnostic settings       │     └─────────────────────┘
+└──────────────────┘     │  • Cached fallback           │              │
+                         └─────────────────────────────┘              ▼
+                                      │                     ┌─────────────────────┐
+                                      ▼                     │  Log Analytics      │
+                              ┌───────────────┐             │  Workspace          │
+                              │ Azure Monitor │────────────▶│  (long-term store)  │
+                              └───────────────┘             └─────────────────────┘
+```
+
+### Graceful Degradation Modalities
+
+| Modality | APIM Implementation | When to Use |
+|----------|---------------------|-------------|
+| **Token rate limiting** | `azure-openai-token-limit` policy | Prevent token budget exhaustion across all consumers |
+| **HTTP 429 handling** | `retry` policy + `Retry-After` header propagation | Backend is rate-limited; respect and relay wait times |
+| **Backend pool failover** | `set-backend-service` in `<choose>` block | Primary Foundry endpoint returns 429 or 5xx; failover to secondary |
+| **Circuit breaker (gateway)** | Context variable tracking + `return-response` | Consecutive backend failures detected at gateway level |
+| **Cached fallback** | `cache-lookup` / `cache-store` policies | Return cached assessment for recently-evaluated clients during outages |
+| **Queue-based buffering** | Service Bus integration policy | Buffer excess requests during peak load instead of rejecting |
+| **Graceful error response** | `return-response` with custom body | Return informative error with retry guidance instead of raw 429/503 |
+
+### Token Economics via APIM
+
+APIM serves as the **enforcement point** for token budgets:
+
+1. **Local orchestrator** captures per-request token usage from `AgentResponse.token_usage`
+2. **APIM** aggregates token consumption across all consumers via `azure-openai-token-limit` policy
+3. **Azure Monitor** receives token metrics from APIM diagnostic settings
+4. **Alert rules** trigger when per-minute/per-hour token thresholds are approached
+
+### Observability Pipeline via APIM
+
+APIM provides the **telemetry bridge** between the orchestrator and Log Analytics:
+
+1. **Request/response logging** — APIM captures prompts, responses, and token counts
+2. **Diagnostic settings** route logs to a Log Analytics workspace
+3. **Agent reasoning traces** (captured locally from `AgentResponse.reasoning`) are logged via structured logging and can be forwarded via Application Insights or direct Log Analytics ingestion
+4. **Foundry v2 project** diagnostic settings provide an additional telemetry stream
+
+---
+
 ## Success Criteria
 
 1. ✅ Workflow accepts a single `client_id` input

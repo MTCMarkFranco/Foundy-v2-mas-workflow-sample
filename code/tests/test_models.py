@@ -5,10 +5,12 @@ from pydantic import ValidationError
 
 from src.models.input import WorkflowInput
 from src.models.output import (
+    AgentStageMetrics,
     RiskAssessment,
     RuleEvaluation,
     SearchResult,
     SummaryOutput,
+    TokenUsage,
     WorkflowResult,
 )
 
@@ -98,3 +100,77 @@ class TestWorkflowResult:
         )
         assert result.client_id == "CLT-10001"
         assert result.completed_at is not None
+        assert result.stage_metrics == []
+
+    def test_total_token_usage_empty(self):
+        assessment = RiskAssessment(client_id="CLT-10001", risk_score="Low")
+        summary = SummaryOutput(client_id="CLT-10001", risk_score="Low")
+        result = WorkflowResult(
+            client_id="CLT-10001",
+            risk_score="Low",
+            risk_assessment=assessment,
+            summary=summary,
+        )
+        total = result.total_token_usage
+        assert total.total_tokens == 0
+
+    def test_total_token_usage_aggregates(self):
+        assessment = RiskAssessment(client_id="CLT-10001", risk_score="Low")
+        summary = SummaryOutput(client_id="CLT-10001", risk_score="Low")
+        result = WorkflowResult(
+            client_id="CLT-10001",
+            risk_score="Low",
+            risk_assessment=assessment,
+            summary=summary,
+            stage_metrics=[
+                AgentStageMetrics(
+                    agent_name="CategorizeRiskAgent",
+                    token_usage=TokenUsage(
+                        prompt_tokens=500, completion_tokens=200, total_tokens=700
+                    ),
+                ),
+                AgentStageMetrics(
+                    agent_name="SummarizeAgent",
+                    token_usage=TokenUsage(
+                        prompt_tokens=800, completion_tokens=300, total_tokens=1100
+                    ),
+                ),
+            ],
+        )
+        total = result.total_token_usage
+        assert total.prompt_tokens == 1300
+        assert total.completion_tokens == 500
+        assert total.total_tokens == 1800
+
+
+# ── TokenUsage model ────────────────────────────────────────────────
+
+class TestTokenUsage:
+    def test_defaults(self):
+        t = TokenUsage()
+        assert t.prompt_tokens == 0
+        assert t.completion_tokens == 0
+        assert t.total_tokens == 0
+
+    def test_explicit_values(self):
+        t = TokenUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+        assert t.total_tokens == 150
+
+
+# ── AgentStageMetrics model ─────────────────────────────────────────
+
+class TestAgentStageMetrics:
+    def test_defaults(self):
+        m = AgentStageMetrics(agent_name="TestAgent")
+        assert m.token_usage.total_tokens == 0
+        assert m.reasoning == ""
+        assert m.duration_seconds == 0.0
+
+    def test_with_reasoning(self):
+        m = AgentStageMetrics(
+            agent_name="CategorizeRiskAgent",
+            reasoning="I analyzed the client data and found no discrepancies.",
+            token_usage=TokenUsage(prompt_tokens=500, completion_tokens=200, total_tokens=700),
+        )
+        assert "no discrepancies" in m.reasoning
+        assert m.token_usage.prompt_tokens == 500

@@ -19,6 +19,9 @@
 - [Azure AI Search Integration](#-azure-ai-search-integration)
 - [Risk Scoring Engine](#-risk-scoring-engine)
 - [Agent Output Contracts](#-agent-output-contracts)
+- [Token Economics](#-token-economics)
+- [Graceful Degradation & AI Gateway](#-graceful-degradation--ai-gateway)
+- [Observability Pipeline](#-observability-pipeline)
 - [Prerequisites](#-prerequisites)
 - [Getting Started](#-getting-started)
 - [Running the Sample](#-running-the-sample)
@@ -350,6 +353,223 @@ weighted_score = Σ (discrepancy_count × severity_weight)
 
 ---
 
+## 💰 Token Economics
+
+Understanding token consumption per agent call is critical for cost management, throttling decisions, and capacity planning.
+
+### How Token Tracking Works
+
+The MAF `AgentResponse` object exposes a `.token_usage` property with `prompt_tokens`, `completion_tokens`, and `total_tokens`. The orchestrator captures this metadata from each agent stage and surfaces it through multiple channels:
+
+```
+AgentResponse.token_usage
+  ├──▶ AgentStageMetrics (per-agent: CategorizeRisk, Summarize)
+  ├──▶ WorkflowResult.total_token_usage (aggregated)
+  ├──▶ CLI: 📊 Token Usage panel
+  └──▶ Structured log: [WORKFLOW:{id}] tokens(prompt=X, completion=Y, total=Z)
+```
+
+### Token Usage Output
+
+```python
+# Programmatic access
+result = await workflow.execute("CLT-10001")
+total = result.total_token_usage
+print(f"Total tokens: {total.total_tokens}")
+for stage in result.stage_metrics:
+    print(f"  {stage.agent_name}: {stage.token_usage.total_tokens}")
+```
+
+```
+# CLI output (automatic)
+╭──────────────── 📊 Token Usage ─────────────────╮
+│  CategorizeRiskAgent: prompt=1,200  completion=450  total=1,650  │
+│  SummarizeAgent:      prompt=1,800  completion=600  total=2,400  │
+│  ──────────────────────────────────────────────────              │
+│  Total:               prompt=3,000  completion=1,050 total=4,050 │
+╰─────────────────────────────────────────────────────────────────╯
+```
+
+### When to Implement Throttling
+
+Use token usage data to inform throttling decisions:
+
+| Signal | Threshold | Action |
+|--------|-----------|--------|
+| Single request tokens | > 10,000 total | Log warning; consider prompt optimization |
+| Per-minute aggregate | Approaching model TPM limit | Enable APIM token rate limiting |
+| Per-hour cost | > budget threshold | Alert + reject non-critical requests |
+| Sustained high usage | > 80% capacity for 5+ min | Activate backend pool failover |
+
+> **Note**: Local token tracking provides per-request visibility. For cross-request aggregation and enforcement, deploy **Azure API Management** as an AI Gateway (see [Graceful Degradation](#-graceful-degradation--ai-gateway)).
+
+---
+
+## 🛡️ Graceful Degradation & AI Gateway
+
+Production deployments should use **Azure API Management (APIM)** as an AI Gateway in front of Foundry endpoints. APIM provides multiple modalities for handling rate limits, backend failures, and capacity exhaustion that the local orchestrator cannot implement alone.
+
+### Architecture — APIM as AI Gateway
+
+```mermaid
+graph LR
+    subgraph LOCAL["🖥️ Local Orchestrator"]
+        CB["🔄 Circuit Breaker"]
+        RETRY["🔁 Retry Logic"]
+        TIMEOUT["⏱️ Timeout"]
+    end
+
+    subgraph APIM["🌐 Azure API Management (AI Gateway)"]
+        TRL["📊 Token Rate Limit"]
+        R429["🔁 429 + Retry-After"]
+        BPF["🔀 Backend Pool Failover"]
+        CACHE["💾 Cached Fallback"]
+        DIAG["📋 Diagnostic Logging"]
+    end
+
+    subgraph FOUNDRY["☁️ Azure AI Foundry"]
+        PRIMARY["🤖 Primary Endpoint"]
+        BACKUP["🤖 Backup Endpoint"]
+    end
+
+    subgraph MONITOR["📈 Monitoring"]
+        AM["Azure Monitor"]
+        LA["Log Analytics"]
+    end
+
+    LOCAL -->|"HTTPS"| APIM
+    APIM -->|"Primary"| PRIMARY
+    APIM -->|"Failover"| BACKUP
+    DIAG --> AM
+    AM --> LA
+```
+
+### Degradation Modalities
+
+| # | Modality | APIM Policy | When It Triggers |
+|---|----------|-------------|-----------------|
+| 1 | **Token rate limiting** | `azure-openai-token-limit` | Token budget per minute/hour exhausted |
+| 2 | **HTTP 429 handling** | `retry` + `Retry-After` header | Backend returns 429; APIM respects wait time and retries or propagates to caller |
+| 3 | **Backend pool failover** | `set-backend-service` in `<choose>` | Primary endpoint returns 429/5xx; traffic routes to secondary Foundry deployment |
+| 4 | **Gateway circuit breaker** | Context variable tracking + `return-response` | Consecutive backend failures detected at gateway level |
+| 5 | **Cached fallback** | `cache-lookup` / `cache-store` | Return cached risk assessment for recently-evaluated clients during outages |
+| 6 | **Queue-based buffering** | Service Bus integration | Buffer excess requests during peak load instead of rejecting |
+| 7 | **Graceful error response** | `return-response` with custom body | Return informative error with retry guidance instead of raw 429/503 |
+
+### Example APIM Policy (429 Failover)
+
+```xml
+<outbound>
+    <choose>
+        <when condition="@(context.Response.StatusCode == 429)">
+            <!-- Failover to backup Foundry endpoint -->
+            <set-backend-service base-url="https://foundry-backup.services.ai.azure.com/api/projects/dev" />
+            <forward-request />
+        </when>
+    </choose>
+</outbound>
+```
+
+### How Local Resilience Complements APIM
+
+| Layer | Handles | Doesn't Handle |
+|-------|---------|----------------|
+| **Local** (circuit breaker, retry, timeout) | Transient failures, deadline enforcement, state isolation | Cross-consumer token budgets, backend pool routing, 429 aggregation |
+| **APIM** (AI Gateway) | Token rate limits, 429 failover, backend pools, request logging | Conversation state, JSON parsing, cross-agent consistency |
+
+> Both layers are complementary. The local circuit breaker protects the orchestrator; APIM protects the entire system.
+
+---
+
+## 🔭 Observability Pipeline
+
+The observability system captures three types of telemetry from agent executions: **token usage**, **reasoning traces**, and **workflow metrics**. Data flows through a three-tier pipeline.
+
+### Three-Tier Observability Architecture
+
+```
+Tier 1: LOCAL CLI                    Tier 2: APIM GATEWAY              Tier 3: LOG ANALYTICS
+┌─────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────┐
+│ 📊 Token usage      │     │ 📋 Request/response     │     │ 📈 Cross-project    │
+│    panel             │     │    logging              │     │    analytics        │
+│ 💭 Reasoning traces │     │ 📊 Token consumption    │     │ 🔍 Query & alerting │
+│    (dim magenta)    │     │    metrics              │     │ 📊 Dashboards       │
+│ 🔗 Correlation IDs  │     │ ⏱️ Latency percentiles │     │ 📦 Long-term store  │
+└─────────────────────┘     └─────────────────────────┘     └─────────────────────┘
+        ▲                            ▲                              ▲
+        │                            │                              │
+   Orchestrator               APIM Diagnostic              Foundry v2 SDK
+   _extract_stage_metrics()    Settings                    Telemetry Pipeline
+```
+
+### Reasoning Traces
+
+MAF `AgentResponse` messages may include a `.reasoning` property containing the model's chain-of-thought process — the step-by-step logic the agent used to arrive at its answer. This is **separate from the structured JSON output** and provides crucial insight into agent decision-making.
+
+**Capture Flow**:
+```
+AgentResponse
+  ├── .text       → Structured JSON output (parsed → RiskAssessment / SummaryOutput)
+  ├── .reasoning  → Chain-of-thought trace (captured → AgentStageMetrics.reasoning)
+  └── .token_usage → Token counts (captured → AgentStageMetrics.token_usage)
+```
+
+**CLI Display** (via `--verbose`):
+
+```
+╭──── 💭 CategorizeRiskAgent Reasoning ─────╮
+│ I queried the knowledge base for           │
+│ CLT-10001 and found 2 documents. Both      │
+│ show current compliance status with no     │
+│ risk flags. Applied rules D1-D5 and        │
+│ C1-C5: all passed. Weighted score = 0.     │
+│ Classification: Low risk.                   │
+╰────────────────────────────────────────────╯
+```
+
+> Reasoning is rendered in **dim magenta** to visually distinguish it from the primary output. Enable with `--verbose` flag or `ENABLE_REASONING_DISPLAY=true`.
+
+### Observability Configuration
+
+| Setting | Env Var | Default | Description |
+|---------|---------|---------|-------------|
+| **Reasoning display** | `ENABLE_REASONING_DISPLAY` | `true` | Show reasoning traces in CLI (when `--verbose` is used) |
+
+### Pipeline to Log Analytics (Future)
+
+The full observability pipeline routes telemetry from the local orchestrator through Foundry v2 to a Log Analytics workspace:
+
+1. **Local orchestrator** → Structured logs with correlation IDs, token counts, reasoning
+2. **Foundry v2 SDK** → Agent invocation telemetry sent to the Foundry project
+3. **Foundry project diagnostic settings** → Route telemetry to Log Analytics workspace
+4. **APIM diagnostic settings** → Route request/response logs and token metrics to Log Analytics
+5. **Log Analytics** → KQL queries for cross-project analysis, alerting, and dashboards
+
+```
+Local Orchestrator                    Azure
+┌─────────────────┐     ┌──────────────────────────────────────┐
+│ _extract_stage_  │     │  Foundry v2 Project                 │
+│  metrics()       │────▶│  • Agent telemetry                  │
+│                  │     │  • Diagnostic settings ──────────┐  │
+│ Structured logs  │     └──────────────────────────────────│──┘
+│ [WORKFLOW:{id}]  │                                        │
+│                  │     ┌──────────────────────────────┐   │
+│                  │     │  APIM AI Gateway              │   │
+│                  │────▶│  • Request/response logs      │   │
+│                  │     │  • Token metrics ─────────┐   │   │
+└─────────────────┘     └──────────────────────────│───┘   │
+                                                    ▼       ▼
+                                          ┌─────────────────────┐
+                                          │  Log Analytics       │
+                                          │  Workspace           │
+                                          │  • KQL queries       │
+                                          │  • Alert rules       │
+                                          │  • Workbooks         │
+                                          └─────────────────────┘
+```
+
+---
+
 ## ✅ Prerequisites
 
 Before running this sample, ensure you have:
@@ -459,6 +679,18 @@ python -m src.main CLT-10001
 # Get raw JSON output (for piping to other tools)
 python -m src.main CLT-10001 --json
 ```
+
+### Verbose Output (Reasoning Traces)
+
+```bash
+# Show agent reasoning traces alongside the risk assessment
+python -m src.main CLT-10001 --verbose
+
+# Combine with JSON output
+python -m src.main CLT-10001 --json --verbose
+```
+
+The `--verbose` flag displays each agent's chain-of-thought reasoning in a distinct **magenta** panel, helping you understand *why* the agent made its classification decision. Token usage is always displayed when available.
 
 ---
 
@@ -592,6 +824,9 @@ CIRCUIT_BREAKER_RECOVERY_SECONDS=30.0  # Seconds before HALF-OPEN probe
 
 # ── Concurrency (for service deployment) ───────────
 MAX_CONCURRENT_REQUESTS=5          # Max parallel workflow executions
+
+# ── Observability ──────────────────────────────────
+ENABLE_REASONING_DISPLAY=true      # Show reasoning traces (with --verbose)
 ```
 
 > All settings use `load_dotenv(override=False)` — Foundry runtime environment variables always take precedence over `.env` file values.
@@ -607,9 +842,9 @@ MAX_CONCURRENT_REQUESTS=5          # Max parallel workflow executions
 | Separation of Concerns | 50% | 🟢 Resilience layer separated |
 | Fast Failures | 50% | 🟢 asyncio.wait_for() enforced |
 | Circuit Breaker | 35% | 🟢 Full state machine |
-| Token Economics | 0% | 🔴 MAF doesn't expose tokens |
-| Graceful Degradation | 10% | 🔴 Limiter available; no API queue |
-| Observability | 30% | 🟢 Correlation IDs + durations |
+| Token Economics | 25% | 🟡 Per-stage usage tracked; APIM for enforcement |
+| Graceful Degradation | 20% | 🟡 Local breaker; APIM recommended for 429/failover |
+| Observability | 50% | 🟢 Tokens, reasoning, correlation IDs, durations |
 
 See [ACTOR-PATTERN-COMPLIANCE.md](prompt-contracts/ACTOR-PATTERN-COMPLIANCE.md) for the full prompt contract with goals, microgoals, ADRs, and testing checklists.
 

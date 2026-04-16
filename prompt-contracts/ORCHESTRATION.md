@@ -175,6 +175,31 @@ def main():
 - Performance is acceptable
 - Code is maintainable
 
+### G-ORCH-005: Token Economics & Observability
+**Objective**: Capture token usage and reasoning from agent responses for cost visibility, debugging, and operational monitoring.
+
+**Success Criteria**:
+- Token usage (prompt/completion/total) extracted from `AgentResponse.token_usage` per agent stage
+- Reasoning traces extracted from `AgentResponse.reasoning` property
+- Token counts logged with correlation ID in structured format
+- CLI displays token usage summary and reasoning traces (via `--verbose`)
+- `AgentStageMetrics` model tracks per-stage metrics in `WorkflowResult`
+- Configuration via `ENABLE_REASONING_DISPLAY` environment variable
+
+**Observability Pipeline** (Local → Foundry → Log Analytics):
+1. **Local**: Orchestrator extracts `token_usage` and `reasoning` from MAF `AgentResponse` messages
+2. **CLI**: Token usage displayed as summary panel; reasoning shown in dim magenta (via `--verbose`)
+3. **Structured logs**: Token counts and reasoning logged with `[WORKFLOW:{correlation_id}]` prefix
+4. **(Future) APIM**: Gateway captures request/response telemetry, token counts via diagnostic settings
+5. **(Future) Foundry v2**: SDK telemetry sent to project for agent-level dashboards
+6. **(Future) Log Analytics**: Long-term storage via APIM/Foundry diagnostic settings for cross-project analysis
+
+**AI Gateway (APIM) Guidance**:
+- Deploy APIM in front of Foundry endpoints for token rate limiting (`azure-openai-token-limit`)
+- Configure backend pools for failover when primary endpoint returns 429/5xx
+- Enable diagnostic settings to route request logs and token metrics to Log Analytics workspace
+- Use `Retry-After` header propagation for graceful 429 handling
+
 ---
 
 ## Microgoals

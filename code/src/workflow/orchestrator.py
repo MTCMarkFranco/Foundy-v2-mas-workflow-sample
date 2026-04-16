@@ -17,7 +17,13 @@ from src.errors import (
     WorkflowTimeoutError,
 )
 from src.models.input import CLIENT_ID_PATTERN, WorkflowInput
-from src.models.output import RiskAssessment, SummaryOutput, WorkflowResult
+from src.models.output import (
+    AgentStageMetrics,
+    RiskAssessment,
+    SummaryOutput,
+    TokenUsage,
+    WorkflowResult,
+)
 from src.resilience import CircuitBreaker, async_retry_with_backoff
 from src.workflow.context import build_workflow_result
 
@@ -36,6 +42,10 @@ class RiskAssessmentWorkflow:
         - **Circuit breaker**: rejects calls when consecutive failures exceed threshold
         - **Async retry**: exponential backoff on transient errors only
         - **Structured logging**: correlation IDs, durations, state transitions
+
+    Observability features:
+        - **Token usage**: captures prompt/completion/total tokens per agent stage
+        - **Reasoning traces**: extracts chain-of-thought reasoning from agent metadata
     """
 
     def __init__(
@@ -138,6 +148,11 @@ class RiskAssessmentWorkflow:
                 f"Expected 2 assistant responses, got {len(assistant_messages)}"
             )
 
+        # Extract token usage and reasoning from workflow result metadata
+        stage_metrics = self._extract_stage_metrics(
+            outputs, duration, correlation_id
+        )
+
         # Stage 1: Parse CategorizeRiskAgent response
         assessment = self._parse_assessment(
             assistant_messages[0], validated.client_id
@@ -156,10 +171,29 @@ class RiskAssessmentWorkflow:
             f"urgency={summary.urgency_level}"
         )
 
-        result_out = build_workflow_result(assessment, summary)
+        # Log token usage if available
+        for metrics in stage_metrics:
+            if metrics.token_usage.total_tokens > 0:
+                logger.info(
+                    f"[WORKFLOW:{correlation_id}] {metrics.agent_name}: "
+                    f"tokens(prompt={metrics.token_usage.prompt_tokens}, "
+                    f"completion={metrics.token_usage.completion_tokens}, "
+                    f"total={metrics.token_usage.total_tokens})"
+                )
+            if metrics.reasoning:
+                logger.info(
+                    f"[WORKFLOW:{correlation_id}] {metrics.agent_name} reasoning: "
+                    f"{metrics.reasoning[:200]}..."
+                    if len(metrics.reasoning) > 200
+                    else f"[WORKFLOW:{correlation_id}] {metrics.agent_name} reasoning: "
+                    f"{metrics.reasoning}"
+                )
+
+        result_out = build_workflow_result(assessment, summary, stage_metrics)
         logger.info(
             f"[WORKFLOW:{correlation_id}] Completed client={result_out.client_id} "
-            f"risk={result_out.risk_score} duration={duration:.2f}s"
+            f"risk={result_out.risk_score} duration={duration:.2f}s "
+            f"total_tokens={result_out.total_token_usage.total_tokens}"
         )
         return result_out
 
@@ -175,6 +209,62 @@ class RiskAssessmentWorkflow:
             elif hasattr(item, "role") and item.role == "assistant":
                 texts.append(item.text)
         return texts
+
+    @staticmethod
+    def _extract_stage_metrics(
+        outputs: list, total_duration: float, correlation_id: str
+    ) -> list[AgentStageMetrics]:
+        """Extract token usage and reasoning from MAF workflow outputs.
+
+        MAF AgentResponse objects may expose token_usage and reasoning metadata.
+        This method attempts to extract them from the message objects returned
+        by get_outputs(). If the metadata is not available (e.g. when using
+        mocks in tests), it gracefully returns empty metrics.
+        """
+        agent_names = ["CategorizeRiskAgent", "SummarizeAgent"]
+        metrics: list[AgentStageMetrics] = []
+        assistant_idx = 0
+
+        for item in outputs:
+            messages = item if isinstance(item, list) else [item]
+            for msg in messages:
+                if not (hasattr(msg, "role") and msg.role == "assistant"):
+                    continue
+
+                agent_name = (
+                    agent_names[assistant_idx]
+                    if assistant_idx < len(agent_names)
+                    else f"Agent-{assistant_idx}"
+                )
+
+                # Extract token_usage from message metadata if available
+                token_usage = TokenUsage()
+                usage_obj = getattr(msg, "token_usage", None)
+                if usage_obj is not None:
+                    token_usage = TokenUsage(
+                        prompt_tokens=getattr(usage_obj, "prompt_tokens", 0),
+                        completion_tokens=getattr(usage_obj, "completion_tokens", 0),
+                        total_tokens=getattr(usage_obj, "total_tokens", 0),
+                    )
+
+                # Extract reasoning from message metadata if available
+                reasoning = getattr(msg, "reasoning", "") or ""
+
+                metrics.append(AgentStageMetrics(
+                    agent_name=agent_name,
+                    token_usage=token_usage,
+                    reasoning=reasoning,
+                    duration_seconds=total_duration / max(len(agent_names), 1),
+                ))
+                assistant_idx += 1
+
+        # Ensure we always have at least 2 metrics entries
+        while len(metrics) < len(agent_names):
+            metrics.append(AgentStageMetrics(
+                agent_name=agent_names[len(metrics)],
+            ))
+
+        return metrics
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:

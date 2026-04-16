@@ -59,3 +59,9 @@ class Config:
     max_concurrent_requests: int = field(
         default_factory=lambda: int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
     )
+
+    # Observability
+    enable_reasoning_display: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_REASONING_DISPLAY", "true").lower()
+        in ("true", "1", "yes")
+    )
