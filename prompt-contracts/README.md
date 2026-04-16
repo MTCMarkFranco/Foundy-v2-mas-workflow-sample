@@ -17,6 +17,7 @@ The workflow processes a **Client ID** through a sequential two-agent pipeline:
 | [CATEGORIZE-RISK-AGENT.md](./CATEGORIZE-RISK-AGENT.md) | Risk categorization agent instructions |
 | [SUMMARIZE-AGENT.md](./SUMMARIZE-AGENT.md) | Summary generation agent instructions |
 | [ORCHESTRATION.md](./ORCHESTRATION.md) | Microsoft Agent Framework orchestration contract |
+| [ACTOR-PATTERN-COMPLIANCE.md](./ACTOR-PATTERN-COMPLIANCE.md) | Actor Pattern cross-cutting concerns & enforcement rules |
 
 ## Sample Data
 

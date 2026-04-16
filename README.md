@@ -24,6 +24,7 @@
 - [Running the Sample](#-running-the-sample)
 - [Test Data](#-test-data)
 - [Testing](#-testing)
+- [Resilience & Actor Pattern Compliance](#️-resilience--actor-pattern-compliance)
 - [Project Structure](#-project-structure)
 - [License](#-license)
 
@@ -499,6 +500,118 @@ python -m pytest tests/ -v --cov=src
 | `test_config.py` | Environment variable loading, defaults |
 | `test_errors.py` | Exception hierarchy, retry decorator behavior |
 | `test_agents.py` | Code fence stripping helper |
+| `test_resilience.py` | Circuit breaker, async retry, concurrency limiter, typed exceptions |
+
+---
+
+## 🛡️ Resilience & Actor Pattern Compliance
+
+This codebase implements execution-safety patterns inspired by the [Actor Pattern](external_sources/actor-pattern.md) to bridge the gap between AI reasoning and production reliability. See the full prompt contract: [ACTOR-PATTERN-COMPLIANCE.md](prompt-contracts/ACTOR-PATTERN-COMPLIANCE.md).
+
+### Why This Matters
+
+Agent frameworks handle **reasoning** — they do NOT handle **execution safety**. Without resilience patterns, a single backend outage can trigger retry storms, unbounded waits, and cascading failures across all concurrent users. These patterns fill that gap.
+
+### Implemented Patterns
+
+| Pattern | Module | What It Does |
+|---------|--------|--------------|
+| **Timeout Enforcement** | `orchestrator.py` | `asyncio.wait_for()` bounds every workflow execution to a hard deadline |
+| **Circuit Breaker** | `resilience.py` | CLOSED → OPEN → HALF-OPEN state machine; fast-rejects when backend is failing |
+| **Async Retry** | `resilience.py` | Exponential backoff on transient failures only; never retries parse/validation errors |
+| **Concurrency Limiter** | `resilience.py` | Semaphore-based with fast-fail acquisition timeout (for service deployment) |
+| **Typed Exceptions** | `errors.py` | `WorkflowTimeoutError`, `CircuitOpenError` for actionable error handling and UX |
+| **Correlation IDs** | `orchestrator.py` | Unique ID per execution for distributed tracing and log correlation |
+
+### Service Limits & Defaults
+
+#### Timeout & Retry
+
+| Setting | Env Var | Default | Behavior |
+|---------|---------|---------|----------|
+| **Workflow Timeout** | `WORKFLOW_TIMEOUT_SECONDS` | `30` | Hard deadline for the entire workflow execution including all retry attempts. Enforced via `asyncio.wait_for()`. If exceeded, raises `WorkflowTimeoutError`. |
+| **Retry Count** | `RETRY_COUNT` | `3` | Maximum number of attempts before propagating the error. Only transient failures (connection, timeout, OS) are retried — parse and validation errors fail immediately. |
+| **Retry Base Delay** | `RETRY_BASE_DELAY` | `1.0` | Initial backoff seed in seconds. Doubles each attempt (1s → 2s → 4s). Sleep is automatically capped so retries never extend past the workflow timeout deadline. |
+
+> **How timeout and retry interact**: The retry loop operates within a total deadline budget equal to `WORKFLOW_TIMEOUT_SECONDS`. Each attempt checks the remaining time *before* executing and *before* sleeping. This guarantees users never wait longer than the configured timeout, regardless of how many retries are configured.
+
+#### Circuit Breaker (Throttling Protection)
+
+The circuit breaker prevents retry storms when the LLM backend is unhealthy. It uses a three-state machine:
+
+```
+    CLOSED (normal)  ──[threshold failures]──►  OPEN (rejecting)
+         ▲                                          │
+         │                                   [recovery period]
+    [probe succeeds]                                │
+         │                                          ▼
+         └───────────────────────────────  HALF-OPEN (1 probe)
+                                                    │
+                                            [probe fails → re-open]
+```
+
+| Setting | Env Var | Default | Behavior |
+|---------|---------|---------|----------|
+| **Failure Threshold** | `CIRCUIT_BREAKER_THRESHOLD` | `3` | Number of **consecutive** transient failures before the circuit opens. Only infrastructure failures count — parse errors and validation failures are ignored. |
+| **Recovery Period** | `CIRCUIT_BREAKER_RECOVERY_SECONDS` | `30.0` | Seconds the breaker stays OPEN before transitioning to HALF-OPEN. In HALF-OPEN, exactly **one probe request** is allowed through. If the probe succeeds, the breaker closes. If it fails, the breaker re-opens for another recovery period. |
+
+> **What gets rejected**: When OPEN, all calls immediately receive a `CircuitOpenError` with `recovery_remaining` seconds — no backend call is made. This protects both your system and the LLM backend from load amplification during outages.
+
+#### Concurrency Limits
+
+| Setting | Env Var | Default | Behavior |
+|---------|---------|---------|----------|
+| **Max Concurrent Requests** | `MAX_CONCURRENT_REQUESTS` | `5` | Maximum parallel workflow executions (semaphore slots). When all slots are occupied, new requests wait up to 5 seconds for a slot. If no slot becomes available, the request is rejected (fast-fail). |
+
+> **Note**: The concurrency limiter is available in `src/resilience.py` for service deployment. The CLI entry point (`main.py`) runs a single invocation and doesn't require it.
+
+### Failure Classification
+
+The retry and circuit breaker systems classify failures to avoid wasting resources on irrecoverable errors:
+
+| Failure Type | Retried? | Trips Breaker? | Examples |
+|-------------|----------|----------------|----------|
+| **Transient** | ✅ Yes | ✅ Yes | `ConnectionError`, `TimeoutError`, `asyncio.TimeoutError`, `OSError` |
+| **Validation** | ❌ No | ❌ No | `InvalidClientIdError`, Pydantic `ValueError` |
+| **Contract** | ❌ No | ❌ No | `AgentInvocationError` (bad JSON, client_id mismatch) |
+| **Timeout** | ❌ No | ✅ Yes | `WorkflowTimeoutError` (deadline exceeded) |
+
+### Configuration Example
+
+Add these to your `.env` file or set as environment variables:
+
+```bash
+# ── Execution Limits ───────────────────────────────
+WORKFLOW_TIMEOUT_SECONDS=30        # Total deadline for workflow (seconds)
+RETRY_COUNT=3                      # Max retry attempts for transient failures
+RETRY_BASE_DELAY=1.0               # Backoff seed — doubles each retry (seconds)
+
+# ── Circuit Breaker ────────────────────────────────
+CIRCUIT_BREAKER_THRESHOLD=3        # Consecutive failures before OPEN
+CIRCUIT_BREAKER_RECOVERY_SECONDS=30.0  # Seconds before HALF-OPEN probe
+
+# ── Concurrency (for service deployment) ───────────
+MAX_CONCURRENT_REQUESTS=5          # Max parallel workflow executions
+```
+
+> All settings use `load_dotenv(override=False)` — Foundry runtime environment variables always take precedence over `.env` file values.
+
+### Cross-Cutting Concerns Scorecard
+
+| Concern | Score | Status |
+|---------|-------|--------|
+| Isolation | 55% | 🟡 Fresh builder per call; no actor mailbox |
+| Determinism | 40% | 🟡 Sequential pipeline; no request serialization |
+| Concurrency Safety | 25% | 🟡 Limiter available; not wired for CLI |
+| Supervision | 40% | 🟢 Async retry + typed exceptions |
+| Separation of Concerns | 50% | 🟢 Resilience layer separated |
+| Fast Failures | 50% | 🟢 asyncio.wait_for() enforced |
+| Circuit Breaker | 35% | 🟢 Full state machine |
+| Token Economics | 0% | 🔴 MAF doesn't expose tokens |
+| Graceful Degradation | 10% | 🔴 Limiter available; no API queue |
+| Observability | 30% | 🟢 Correlation IDs + durations |
+
+See [ACTOR-PATTERN-COMPLIANCE.md](prompt-contracts/ACTOR-PATTERN-COMPLIANCE.md) for the full prompt contract with goals, microgoals, ADRs, and testing checklists.
 
 ---
 
@@ -514,6 +627,7 @@ Foundy-v2-mas-workflow-sample/
 │   ├── SUMMARIZE-AGENT.md                ← SummarizeAgent prompt contract
 │   ├── ORCHESTRATION.md                  ← MAF orchestration patterns
 │   ├── WORKFLOW-ARCHITECTURE.md          ← Architecture decisions
+│   ├── ACTOR-PATTERN-COMPLIANCE.md       ← Actor Pattern cross-cutting concerns
 │   └── sample-data/
 │       ├── client-risk-data.json         ← 10 sample documents (5 clients)
 │       └── index-schema.json             ← AI Search index definition
@@ -522,8 +636,9 @@ Foundy-v2-mas-workflow-sample/
     ├── src/
     │   ├── main.py                       ← CLI entry point
     │   ├── config.py                     ← Environment-driven configuration
-    │   ├── errors.py                     ← Exception hierarchy + retry
+    │   ├── errors.py                     ← Exception hierarchy (typed resilience errors)
     │   ├── progress.py                   ← Rich console progress display
+    │   ├── resilience.py                 ← Circuit breaker, async retry, concurrency limiter
     │   ├── agents/
     │   │   └── base_agent.py             ← Code fence stripping utility
     │   ├── workflow/

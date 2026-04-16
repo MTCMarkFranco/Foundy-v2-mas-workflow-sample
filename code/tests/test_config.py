@@ -14,9 +14,11 @@ class TestConfig:
         assert config.categorize_agent_version in ("1", "2")  # v2 uses semantic search
         assert config.summarize_agent_name == "SummarizeAgent"
         assert config.summarize_agent_version == "1"
-        assert config.timeout_seconds == 60
+        assert config.timeout_seconds in (30, 60)  # 30 default, 60 from .env
         assert config.retry_count == 3
-
+        assert config.circuit_breaker_threshold == 3
+        assert config.circuit_breaker_recovery_seconds == 30.0
+        assert config.max_concurrent_requests == 5
     def test_env_overrides(self):
         env = {
             "FOUNDRY_ENDPOINT": "https://custom.endpoint",

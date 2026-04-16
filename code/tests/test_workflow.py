@@ -1,12 +1,19 @@
 """Tests for the workflow orchestrator using MAF SequentialBuilder."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.errors import AgentInvocationError, InvalidClientIdError, WorkflowError
+from src.errors import (
+    AgentInvocationError,
+    InvalidClientIdError,
+    WorkflowError,
+    WorkflowTimeoutError,
+)
+from src.resilience import CircuitBreaker
 from src.workflow.orchestrator import RiskAssessmentWorkflow
 
 
@@ -294,3 +301,78 @@ class TestGoldenFixtures:
             result = await wf.execute(client_id)
 
         assert result.risk_score == expected_risk
+
+
+# ── Resilience integration tests ─────────────────────────────────────
+
+class TestWorkflowResilience:
+    @pytest.mark.asyncio
+    async def test_timeout_raises_workflow_timeout_error(self):
+        """If the pipeline hangs, WorkflowTimeoutError is raised."""
+        async def hang_forever(*args, **kwargs):
+            await asyncio.sleep(999)
+
+        mock_workflow = MagicMock()
+        mock_workflow.run = hang_forever
+
+        mock_builder = MagicMock()
+        mock_builder.return_value.build.return_value = mock_workflow
+
+        from src.config import Config
+        config = Config()
+        config.timeout_seconds = 1  # 1 second timeout
+        config.retry_count = 1
+
+        with patch("src.workflow.orchestrator.SequentialBuilder", mock_builder):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock(), config=config)
+            with pytest.raises(WorkflowTimeoutError):
+                await wf.execute("CLT-10001")
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_rejects_when_open(self):
+        """If circuit breaker is open, execution is rejected immediately."""
+        from src.errors import CircuitOpenError
+
+        cb = CircuitBreaker(failure_threshold=1, recovery_seconds=60.0)
+        cb.record_failure()  # Trip the breaker
+
+        wf = RiskAssessmentWorkflow(
+            MagicMock(), MagicMock(), circuit_breaker=cb
+        )
+        with pytest.raises(CircuitOpenError):
+            await wf.execute("CLT-10001")
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_retried_then_succeeds(self):
+        """Transient error on first call is retried and succeeds."""
+        cat = SAMPLE_CATEGORIZE_RESPONSES["CLT-10001"]
+        summary = {**SAMPLE_SUMMARY}
+        mock_result = _make_workflow_run_result(cat, summary)
+
+        call_count = 0
+
+        async def fail_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ConnectionError("transient")
+            return mock_result
+
+        mock_workflow = MagicMock()
+        mock_workflow.run = fail_once
+
+        mock_builder = MagicMock()
+        mock_builder.return_value.build.return_value = mock_workflow
+
+        from src.config import Config
+        config = Config()
+        config.retry_count = 3
+        config.retry_base_delay = 0.01
+        config.timeout_seconds = 30
+
+        with patch("src.workflow.orchestrator.SequentialBuilder", mock_builder):
+            wf = RiskAssessmentWorkflow(MagicMock(), MagicMock(), config=config)
+            result = await wf.execute("CLT-10001")
+
+        assert result.client_id == "CLT-10001"
+        assert call_count == 2

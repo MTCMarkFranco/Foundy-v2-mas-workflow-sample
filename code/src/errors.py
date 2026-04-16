@@ -41,6 +41,29 @@ class InvalidClientIdError(WorkflowError):
         super().__init__(f"Invalid client ID format: '{client_id}'. Expected format: CLT-XXXXX")
 
 
+class WorkflowTimeoutError(WorkflowError):
+    """Workflow execution exceeded the configured timeout."""
+
+    def __init__(self, timeout_seconds: float, client_id: str = ""):
+        self.timeout_seconds = timeout_seconds
+        self.client_id = client_id
+        super().__init__(
+            f"Workflow timed out after {timeout_seconds}s"
+            + (f" for client '{client_id}'" if client_id else "")
+        )
+
+
+class CircuitOpenError(WorkflowError):
+    """Circuit breaker is open — calls are being rejected to allow recovery."""
+
+    def __init__(self, recovery_remaining: float = 0.0):
+        self.recovery_remaining = recovery_remaining
+        super().__init__(
+            f"Circuit breaker open. Recovery in {recovery_remaining:.1f}s. "
+            "System is protecting against cascading failures."
+        )
+
+
 def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
     """Decorator for retry logic with exponential backoff.
 
